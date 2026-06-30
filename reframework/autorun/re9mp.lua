@@ -81,6 +81,9 @@ local state = {
     prefab_hints = "",
     prefab_hint_paths = {},
     prefab_hint_objects = {},
+    character_spawn_status = "",
+    character_spawn_diagnostics = "",
+    last_spawn_components = "",
     last_diagnostic_dump = 0,
     draw_status = "not drawn yet",
 }
@@ -620,6 +623,26 @@ local function normalize_prefab_path(text)
     return path
 end
 
+local function is_effect_prefab_path(path)
+    if not path then return false end
+    local lower = tostring(path):lower():gsub("\\", "/")
+    return lower:find("^vfx/")
+        or lower:find("/vfx/")
+        or lower:find("epv_")
+        or lower:find("epvc")
+        or lower:find("effect")
+end
+
+local function is_character_prefab_path(path)
+    if not path or is_effect_prefab_path(path) then return false end
+    local lower = tostring(path):lower():gsub("\\", "/")
+    return lower:find("cp_a100")
+        or lower:find("a100")
+        or lower:find("player")
+        or lower:find("character")
+        or lower:find("chara")
+end
+
 local function path_from_managed_value(value)
     if value == nil then return nil end
     if type(value) == "string" then
@@ -648,9 +671,7 @@ local function is_prefab_object(value)
         local td = value:get_type_definition()
         if not td then return false end
         local name = td:get_full_name()
-        if name == "via.Prefab" then return true end
-        local prefab_td = sdk.find_type_definition("via.Prefab")
-        return prefab_td and td:is_a(prefab_td)
+        return name == "via.Prefab"
     end)
     return ok and result
 end
@@ -674,10 +695,13 @@ local function collect_prefab_hints_from_object(label, obj, lines, paths, object
                 pcall(function() value = obj:get_field(fname) end)
                 local path = path_from_managed_value(value)
                 if path then
-                    add_unique(paths, path, 24)
-                    add_unique(lines, label .. "." .. fname .. " -> " .. path, 24)
+                    local prefix = is_effect_prefab_path(path) and "effect-only " or ""
+                    if is_character_prefab_path(path) then
+                        add_unique(paths, path, 24)
+                    end
+                    add_unique(lines, prefix .. label .. "." .. fname .. " -> " .. path, 24)
                 end
-                if is_prefab_object(value) then
+                if is_prefab_object(value) and not is_effect_prefab_path(path) then
                     table.insert(objects, { label = label .. "." .. fname, prefab = value })
                 end
             end
@@ -699,10 +723,13 @@ local function collect_prefab_hints_from_object(label, obj, lines, paths, object
                 pcall(function() value = obj:call(name) end)
                 local path = path_from_managed_value(value)
                 if path then
-                    add_unique(paths, path, 24)
-                    add_unique(lines, label .. ":" .. name .. "() -> " .. path, 24)
+                    local prefix = is_effect_prefab_path(path) and "effect-only " or ""
+                    if is_character_prefab_path(path) then
+                        add_unique(paths, path, 24)
+                    end
+                    add_unique(lines, prefix .. label .. ":" .. name .. "() -> " .. path, 24)
                 end
-                if is_prefab_object(value) then
+                if is_prefab_object(value) and not is_effect_prefab_path(path) then
                     table.insert(objects, { label = label .. ":" .. name .. "()", prefab = value })
                 end
             end
@@ -736,6 +763,104 @@ local function collect_prefab_hints(refs)
     state.prefab_hints = table.concat(lines, "\n")
 end
 
+local function type_static_lines(type_name, limit)
+    local lines = {}
+    pcall(function()
+        local td = sdk.find_type_definition(type_name)
+        if not td then
+            table.insert(lines, type_name .. ": type not found")
+            return
+        end
+        local n = 0
+        for _, field in ipairs(td:get_fields()) do
+            if field:is_static() then
+                local name = field:get_name()
+                local value = nil
+                pcall(function() value = field:get_data(nil) end)
+                if value ~= nil then
+                    table.insert(lines, type_name .. "." .. safe_string(name) .. "=" .. safe_string(value))
+                    n = n + 1
+                end
+                if n >= (limit or 16) then break end
+            end
+        end
+        if n == 0 then table.insert(lines, type_name .. ": no static enum fields visible") end
+    end)
+    return lines
+end
+
+local function object_field_summary(label, obj, limit)
+    local lines = {}
+    if not obj or not obj.get_type_definition then return lines end
+    pcall(function()
+        local td = obj:get_type_definition()
+        table.insert(lines, label .. " type=" .. (td and td:get_full_name() or "?"))
+        if not td then return end
+        local n = 0
+        for _, field in ipairs(td:get_fields()) do
+            local name = field:get_name() or ""
+            local ftype = field:get_type()
+            local type_name = ftype and ftype:get_full_name() or "?"
+            local interesting = name:find("Context") or name:find("Kind") or name:find("Character")
+                or name:find("Chara") or name:find("Player") or name:find("Montage")
+                or name:find("Spawn") or name:find("Prefab") or name:find("Resource")
+                or type_name:find("Context") or type_name:find("Kind") or type_name:find("Prefab")
+            if interesting then
+                local value = nil
+                pcall(function() value = obj:get_field(name) end)
+                local path = path_from_managed_value(value)
+                local text = path or safe_string(value)
+                table.insert(lines, "  " .. type_name .. " " .. name .. " = " .. text)
+                n = n + 1
+                if n >= (limit or 28) then break end
+            end
+        end
+    end)
+    return lines
+end
+
+local function collect_character_spawn_diagnostics(refs)
+    local lines = {}
+    for _, type_name in ipairs({
+        "app.ContextID",
+        "app.CharacterKindID",
+        "app.MontageID",
+        "app.CharacterUsePurposeFlag",
+    }) do
+        for _, line in ipairs(type_static_lines(type_name, 20)) do
+            table.insert(lines, line)
+        end
+    end
+
+    local char_mgr = sdk.get_managed_singleton("app.CharacterManager")
+    if not char_mgr then
+        state.character_spawn_diagnostics = table.concat(lines, "\n")
+        return
+    end
+
+    for _, id in ipairs({1, 0, 2, 13632}) do
+        local data = nil
+        local ok, err = pcall(function()
+            data = char_mgr:call("getSpawnDataRef(app.ContextID)", id)
+                or char_mgr:call("getSpawnDataRef", id)
+        end)
+        if ok and data then
+            for _, line in ipairs(object_field_summary("getSpawnDataRef(" .. tostring(id) .. ")", data, 36)) do
+                table.insert(lines, line)
+            end
+        elseif not ok then
+            table.insert(lines, "getSpawnDataRef(" .. tostring(id) .. ") failed: " .. safe_string(err))
+        end
+    end
+
+    if refs and refs.player then
+        for _, line in ipairs(object_field_summary("PlayerContext", refs.player, 40)) do
+            table.insert(lines, line)
+        end
+    end
+    state.character_spawn_diagnostics = table.concat(lines, "\n")
+end
+
 local function dump_runtime_diagnostics()
     if now() < state.last_diagnostic_dump + 2.0 then return end
     state.last_diagnostic_dump = now()
@@ -747,6 +872,7 @@ local function dump_runtime_diagnostics()
         collect_player_fields(refs.player)
     end
     collect_prefab_hints(refs)
+    collect_character_spawn_diagnostics(refs)
     collect_scene_candidates()
     collect_method_signatures()
 
@@ -763,6 +889,9 @@ local function dump_runtime_diagnostics()
             player_fields = state.player_fields,
             prefab_hints = state.prefab_hints,
             prefab_hint_paths = state.prefab_hint_paths,
+            character_spawn_status = state.character_spawn_status,
+            character_spawn_diagnostics = state.character_spawn_diagnostics,
+            last_spawn_components = state.last_spawn_components,
         })
     end)
 end
@@ -886,6 +1015,34 @@ local function first_scene_transform()
     return xform
 end
 
+local function component_summary_for_go(go, limit)
+    local names = {}
+    pcall(function()
+        local components = go and go:call("get_Components")
+        if not components then return end
+        local count = components:call("get_Count") or 0
+        for i = 0, math.min(count - 1, (limit or 80)) do
+            pcall(function()
+                local comp = components:call("get_Item", i)
+                if not comp then return end
+                local td = comp:get_type_definition()
+                table.insert(names, td and td:get_full_name() or "unknown")
+            end)
+        end
+    end)
+    return table.concat(names, ", ")
+end
+
+local function looks_like_grace_character(go)
+    local summary = component_summary_for_go(go, 90)
+    state.last_spawn_components = summary
+    return summary:find("app.Cp_A100")
+        or summary:find("PlayerMeshController")
+        or summary:find("ActorPlayerMeshController")
+        or summary:find("PlayerThinkDriver")
+        or summary:find("via.motion.Motion")
+end
+
 local function adopt_puppet_from_result(result, label)
     local go, xform = nil, nil
     if result and is_valid_managed(result) then
@@ -905,6 +1062,16 @@ local function adopt_puppet_from_result(result, label)
     end
 
     if not xform or not is_valid_managed(xform) then
+        return false
+    end
+
+    if not go then
+        state.puppet_status = "spawned transform without GameObject via " .. label
+        return false
+    end
+
+    if go and not looks_like_grace_character(go) then
+        state.puppet_status = "spawned non-character via " .. label
         return false
     end
 
@@ -981,6 +1148,9 @@ local function try_spawn_prefab_candidate(refs)
     local errors = {}
 
     if cfg.prefab_path and cfg.prefab_path ~= "" then
+        if is_effect_prefab_path(cfg.prefab_path) then
+            table.insert(errors, "manual path is effect-only, not Grace body")
+        else
         local prefab, created_or_err = create_prefab_from_path(cfg.prefab_path)
         if prefab then
             local ok, err = try_spawn_prefab_object(prefab, "manual " .. created_or_err, refs)
@@ -988,6 +1158,7 @@ local function try_spawn_prefab_candidate(refs)
             table.insert(errors, "manual: " .. safe_string(err))
         else
             table.insert(errors, "manual create: " .. safe_string(created_or_err))
+        end
         end
     end
 
@@ -1014,7 +1185,53 @@ local function try_spawn_prefab_candidate(refs)
     return false, errors[1]
 end
 
-local function try_spawn_puppet()
+local function try_character_manager_spawn(refs)
+    local char_mgr = sdk.get_managed_singleton("app.CharacterManager")
+    if not char_mgr then return false, "CharacterManager not found" end
+
+    collect_character_spawn_diagnostics(refs)
+
+    local before = first_scene_transform()
+    local calls = {
+        {
+            name = "requestSpawn(app.ContextID, app.CharacterKindID, app.MontageID, System.Int32, System.Boolean, app.CharacterUsePurposeFlag)",
+            args = { 1, 13632, 0, 0, true, 0 },
+            label = "cp_A100/A100/default",
+        },
+        {
+            name = "requestSpawn(app.ContextID, app.CharacterKindID, app.MontageID, System.Int32, System.Boolean, app.CharacterUsePurposeFlag)",
+            args = { 1, 13632, 0, 0, false, 0 },
+            label = "cp_A100/A100/no-force",
+        },
+        {
+            name = "requestSpawn(app.ContextID, app.CharacterKindID, app.MontageID, System.Int32, System.Boolean, app.CharacterUsePurposeFlag)",
+            args = { 1, 1, 0, 0, true, 0 },
+            label = "cp_A100/kind1/default",
+        },
+    }
+
+    local errors = {}
+    for _, call in ipairs(calls) do
+        local ok, err = pcall(function()
+            char_mgr:call(call.name, unpack_args(call.args))
+        end)
+        if ok then
+            state.character_spawn_status = "requestSpawn accepted: " .. call.label
+            local after = first_scene_transform()
+            if after and after ~= before and adopt_puppet_from_result(after, "CharacterManager " .. call.label) then
+                return true
+            end
+            return false, state.character_spawn_status .. "; no new character transform detected yet"
+        else
+            table.insert(errors, call.label .. ": " .. safe_string(err))
+        end
+    end
+
+    state.character_spawn_status = (#errors > 0 and errors[1]) or "requestSpawn had no callable overload"
+    return false, state.character_spawn_status
+end
+
+local function try_spawn_puppet(manual)
     state.puppet_last_attempt = now()
     local refs = get_local_player_refs()
     if not refs.valid or not refs.go then
@@ -1024,6 +1241,13 @@ local function try_spawn_puppet()
 
     local prefab_ok, prefab_err = try_spawn_prefab_candidate(refs)
     if prefab_ok then return true end
+
+    local character_err = ""
+    if manual then
+        local character_ok, err = try_character_manager_spawn(refs)
+        if character_ok then return true end
+        character_err = " | character manager: " .. safe_string(err)
+    end
 
     collect_clone_candidates(refs.go)
 
@@ -1043,7 +1267,7 @@ local function try_spawn_puppet()
     end
 
     if not clone then
-        state.puppet_status = "prefab failed: " .. safe_string(prefab_err) .. " | clone method not found yet"
+        state.puppet_status = "prefab failed: " .. safe_string(prefab_err) .. character_err .. " | clone method not found yet"
         return false
     end
 
@@ -1077,11 +1301,6 @@ end
 local function apply_remote_pose()
     local pose = current_remote_pose()
     if not pose or not pose.valid then return end
-
-    if (not state.puppet_xform or not is_valid_managed(state.puppet_xform))
-        and cfg.auto_spawn_puppet and now() > state.puppet_last_attempt + 2.0 then
-        try_spawn_puppet()
-    end
 
     if not state.puppet_xform or not is_valid_managed(state.puppet_xform) then return end
 
@@ -1301,7 +1520,7 @@ local function draw_main_window()
         state.remote_last_seq = nil
         save_cfg()
     end
-    local auto_changed, auto_val = imgui.checkbox("Auto spawn remote puppet", cfg.auto_spawn_puppet)
+    local auto_changed, auto_val = imgui.checkbox("Auto move spawned puppet", cfg.auto_spawn_puppet)
     if auto_changed then
         cfg.auto_spawn_puppet = auto_val
         save_cfg()
@@ -1336,6 +1555,12 @@ local function draw_main_window()
     else
         imgui.text_colored("Prefab hints: none found yet", 0xFF8888FF)
     end
+    if state.character_spawn_status ~= "" then
+        imgui.text("CharacterManager: " .. safe_string(state.character_spawn_status))
+    end
+    if state.last_spawn_components ~= "" then
+        imgui.text("Last spawn components dumped to runtime_diagnostics.json")
+    end
     if state.clone_candidates ~= "" then
         imgui.text("Clone candidates: " .. state.clone_candidates)
     end
@@ -1345,7 +1570,7 @@ local function draw_main_window()
     if state.method_signatures ~= "" then
         imgui.text("Method signatures dumped to runtime_diagnostics.json")
     end
-    if imgui.button("Probe Grace Prefab/Clone") then try_spawn_puppet() end
+    if imgui.button("Probe Grace Character Spawn") then try_spawn_puppet(true) end
     imgui.same_line()
     if imgui.button("Despawn Puppet") then despawn_puppet() end
 
