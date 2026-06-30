@@ -54,6 +54,8 @@ local state = {
     last_pos = nil,
     last_pos_time = nil,
     remote_last_seq = nil,
+    remote_prev_seq = nil,
+    remote_seq_changed_at = 0,
     remote_samples = {},
     remote_read_time = 0,
     puppet_go = nil,
@@ -319,6 +321,43 @@ local function current_remote_pose()
         flags = newer.data.flags or 0,
         motion = newer.data.motion or "",
         stance = newer.data.stance or "",
+    }
+end
+
+local function remote_readout()
+    local pose = current_remote_pose()
+    local local_snap = state.local_snapshot
+    if not pose or not pose.valid then
+        return {
+            valid = false,
+            text = "Remote: no snapshot",
+        }
+    end
+
+    local dx, dy, dz, dist = 0, 0, 0, 0
+    if local_snap and local_snap.valid then
+        dx = (pose.px or 0) - (local_snap.px or 0)
+        dy = (pose.py or 0) - (local_snap.py or 0)
+        dz = (pose.pz or 0) - (local_snap.pz or 0)
+        dist = math.sqrt((dx * dx) + (dy * dy) + (dz * dz))
+    end
+
+    local speed = math.sqrt(((pose.vx or 0) * (pose.vx or 0)) + ((pose.vz or 0) * (pose.vz or 0)))
+    local age = 0
+    if #state.remote_samples > 0 then
+        age = math.floor((now() - state.remote_samples[#state.remote_samples].t) * 1000)
+    end
+
+    return {
+        valid = true,
+        text = string.format(
+            "Remote: seq %s | age %dms | %.1fm away | dx %.1f dz %.1f | %s %.2fm/s",
+            safe_string(pose.seq), age, dist, dx, dz, safe_string(pose.stance), speed
+        ),
+        dx = dx,
+        dz = dz,
+        dist = dist,
+        speed = speed,
     }
 end
 
@@ -631,6 +670,17 @@ local function draw_main_window()
         .. safe_string(st.packets_received or 0) .. "/"
         .. safe_string(st.packets_dropped or 0))
     imgui.text("Remote age: " .. safe_string(st.remote_age_ms or 0) .. " ms")
+    local rr = remote_readout()
+    if rr.valid then
+        imgui.text_colored(rr.text, 0xFF00FFFF)
+        if math.abs(rr.dx) > math.abs(rr.dz) then
+            imgui.text("Direction: mostly " .. (rr.dx > 0 and "+X / right-ish" or "-X / left-ish"))
+        else
+            imgui.text("Direction: mostly " .. (rr.dz > 0 and "+Z / forward-ish" or "-Z / back-ish"))
+        end
+    else
+        imgui.text_colored(rr.text, 0xFF8888FF)
+    end
 
     imgui.separator()
     local auto_changed, auto_val = imgui.checkbox("Auto spawn remote puppet", cfg.auto_spawn_puppet)
