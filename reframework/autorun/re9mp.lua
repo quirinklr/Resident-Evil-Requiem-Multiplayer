@@ -38,6 +38,11 @@ local function now_ms()
     return math.floor(now() * 1000.0)
 end
 
+local function atan2(y, x)
+    if math.atan2 then return math.atan2(y, x) end
+    return math.atan(y, x)
+end
+
 local function safe_string(v)
     if v == nil then return "" end
     return tostring(v)
@@ -280,6 +285,20 @@ local function read_remote_snapshot()
     end
 end
 
+local function yaw_forward_from_snapshot(snap)
+    if not snap then return 0, 1 end
+    local qx = snap.qx or 0
+    local qy = snap.qy or 0
+    local qz = snap.qz or 0
+    local qw = snap.qw or 1
+    local yaw = atan2(2.0 * ((qw * qy) + (qx * qz)), 1.0 - (2.0 * ((qy * qy) + (qz * qz))))
+    local fx = math.sin(yaw)
+    local fz = math.cos(yaw)
+    local len = math.sqrt((fx * fx) + (fz * fz))
+    if len < 0.001 then return 0, 1 end
+    return fx / len, fz / len
+end
+
 local function update_local_dummy()
     if not cfg.local_dummy then return end
     local snap = state.local_snapshot
@@ -289,22 +308,28 @@ local function update_local_dummy()
     state.dummy_last_time = t
     state.dummy_seq = state.dummy_seq + 1
 
-    local orbit = t * 1.3
-    local radius = 2.5
+    local fx, fz = yaw_forward_from_snapshot(snap)
+    local side_x, side_z = fz, -fx
+    local distance = 2.4
+    local sway = math.sin(t * 1.8) * 0.45
+    local px = (snap.px or 0) + (fx * distance) + (side_x * sway)
+    local pz = (snap.pz or 0) + (fz * distance) + (side_z * sway)
+    local vx = (side_x * math.cos(t * 1.8) * 0.81)
+    local vz = (side_z * math.cos(t * 1.8) * 0.81)
     local dummy = {
         valid = true,
         seq = state.dummy_seq,
         scene = snap.scene,
-        px = (snap.px or 0) + math.cos(orbit) * radius,
+        px = px,
         py = snap.py or 0,
-        pz = (snap.pz or 0) + math.sin(orbit) * radius,
+        pz = pz,
         qx = 0,
         qy = snap.qy or 0,
         qz = 0,
         qw = snap.qw or 1,
-        vx = -math.sin(orbit) * radius * 1.3,
+        vx = vx,
         vy = 0,
-        vz = math.cos(orbit) * radius * 1.3,
+        vz = vz,
         flags = 1,
         motion = "dummy",
         stance = "dummy",
@@ -317,6 +342,12 @@ end
 
 local function lerp(a, b, f)
     return a + ((b - a) * f)
+end
+
+local function clamp(v, lo, hi)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
 end
 
 local function current_remote_pose()
@@ -720,27 +751,92 @@ local function draw_remote_marker()
         return
     end
 
-    local ok, err = pcall(function()
-        if not draw then error("draw global missing") end
-        local feet = Vector3f.new(pose.px or 0, (pose.py or 0) + 0.05, pose.pz or 0)
-        local chest = Vector3f.new(pose.px or 0, (pose.py or 0) + 1.05, pose.pz or 0)
-        local head = Vector3f.new(pose.px or 0, (pose.py or 0) + 1.65, pose.pz or 0)
-        if draw.capsule then draw.capsule(feet, head, 0.24, 0xFF00CCFF, false) end
-        if draw.sphere then draw.sphere(head, 0.18, 0xFF00FFFF, true) end
-        if draw.world_text then draw.world_text("RE9MP remote", chest, 0xFF00FFFF) end
-        local screen = nil
-        if draw.world_to_screen then screen = draw.world_to_screen(chest) end
-        if screen then
-            if draw.filled_circle then draw.filled_circle(screen.x, screen.y, 7, 0xFF00FFFF, 24) end
-            if draw.text then draw.text("RE9MP remote", screen.x + 10, screen.y - 8, 0xFF00FFFF) end
-            state.draw_status = string.format("draw ok: screen %.0f %.0f", screen.x or 0, screen.y or 0)
-        else
-            state.draw_status = "draw ok: remote world point not on screen"
+    if not draw then
+        state.draw_status = "draw global missing"
+        return
+    end
+
+    local rr = remote_readout()
+    local hud_ok, hud_err = pcall(function()
+        if draw.text and rr.valid then
+            draw.text("RE9MP REMOTE " .. string.format("%.1fm dx %.1f dz %.1f", rr.dist, rr.dx, rr.dz), 36, 92, 0xFF00FFFF)
+            draw.text("HUD fallback active", 36, 110, 0xFF00FFFF)
         end
     end)
-    if not ok then
-        state.draw_status = "draw failed: " .. safe_string(err)
+    local hud_status = hud_ok and "hud ok" or ("hud failed: " .. safe_string(hud_err))
+
+    local feet, chest, head = nil, nil, nil
+    local vec_ok, vec_err = pcall(function()
+        feet = Vector3f.new(pose.px or 0, (pose.py or 0) + 0.05, pose.pz or 0)
+        chest = Vector3f.new(pose.px or 0, (pose.py or 0) + 1.05, pose.pz or 0)
+        head = Vector3f.new(pose.px or 0, (pose.py or 0) + 1.65, pose.pz or 0)
+    end)
+    if not vec_ok then
+        state.draw_status = hud_status .. "; vector failed: " .. safe_string(vec_err)
+        return
     end
+
+    local errors = {}
+    if draw.capsule then
+        local ok, err = pcall(function() draw.capsule(feet, head, 0.24, 0xFF00CCFF, false) end)
+        if not ok then table.insert(errors, "capsule " .. safe_string(err)) end
+    end
+    if draw.sphere then
+        local ok, err = pcall(function() draw.sphere(head, 0.18, 0xFF00FFFF, true) end)
+        if not ok then table.insert(errors, "sphere " .. safe_string(err)) end
+    end
+    if draw.world_text then
+        local ok, err = pcall(function() draw.world_text("RE9MP remote", chest, 0xFF00FFFF) end)
+        if not ok then table.insert(errors, "world_text " .. safe_string(err)) end
+    end
+
+    local screen = nil
+    if draw.world_to_screen then
+        local ok, err = pcall(function() screen = draw.world_to_screen(chest) end)
+        if not ok then table.insert(errors, "world_to_screen " .. safe_string(err)) end
+    end
+
+    if screen then
+        if draw.filled_circle then
+            local ok, err = pcall(function() draw.filled_circle(screen.x, screen.y, 8, 0xFF00FFFF, 24) end)
+            if not ok then table.insert(errors, "filled_circle " .. safe_string(err)) end
+        end
+        if draw.text then
+            local ok, err = pcall(function() draw.text("RE9MP remote", screen.x + 12, screen.y - 8, 0xFF00FFFF) end)
+            if not ok then table.insert(errors, "screen_text " .. safe_string(err)) end
+        end
+        state.draw_status = string.format("%s; screen %.0f %.0f", hud_status, screen.x or 0, screen.y or 0)
+    elseif #errors > 0 then
+        state.draw_status = hud_status .. "; world issue: " .. errors[1]
+    else
+        state.draw_status = hud_status .. "; remote world point not on screen"
+    end
+end
+
+local function radar_lines(rr)
+    if not rr or not rr.valid then return nil end
+    local sx = math.floor(clamp(rr.dx / 0.75, -4, 4) + 0.5)
+    local sz = math.floor(clamp(rr.dz / 0.75, -2, 2) + 0.5)
+    local lines = {}
+    table.insert(lines, "+---------+")
+    for row = 2, -2, -1 do
+        local line = "|"
+        for col = -4, 4 do
+            if row == 0 and col == 0 then
+                line = line .. "Y"
+            elseif row == sz and col == sx then
+                line = line .. "R"
+            elseif row == 2 and col == 0 then
+                line = line .. "F"
+            else
+                line = line .. "."
+            end
+        end
+        line = line .. "|"
+        table.insert(lines, line)
+    end
+    table.insert(lines, "+---------+")
+    return lines
 end
 
 local function draw_main_window()
@@ -814,6 +910,13 @@ local function draw_main_window()
             imgui.text("Direction: mostly " .. (rr.dx > 0 and "+X / right-ish" or "-X / left-ish"))
         else
             imgui.text("Direction: mostly " .. (rr.dz > 0 and "+Z / forward-ish" or "-Z / back-ish"))
+        end
+        local lines = radar_lines(rr)
+        if lines then
+            imgui.text("Remote radar: Y=you R=remote F=+Z")
+            for _, line in ipairs(lines) do
+                imgui.text_colored(line, 0xFF00FFFF)
+            end
         end
     else
         imgui.text_colored(rr.text, 0xFF8888FF)
