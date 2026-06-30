@@ -8,6 +8,7 @@ local CFG_FILE = DATA_PREFIX .. "config.json"
 local COMMAND_FILE = DATA_PREFIX .. "command.json"
 local DEV_COMMAND_FILE = DATA_PREFIX .. "dev_command.json"
 local DEV_RESULT_FILE = DATA_PREFIX .. "dev_result.json"
+local SPAWN_HOOK_FILE = DATA_PREFIX .. "spawn_hook_log.json"
 local LOCAL_FILE = DATA_PREFIX .. "local_snapshot.json"
 local STATUS_FILE = DATA_PREFIX .. "status.json"
 local REMOTE_FILE = DATA_PREFIX .. "remote_snapshot.json"
@@ -60,6 +61,7 @@ local state = {
     last_snapshot_time = 0,
     last_status_time = 0,
     last_dev_poll = 0,
+    last_spawn_hook_dump = 0,
     status = nil,
     local_snapshot = nil,
     local_ok = false,
@@ -92,6 +94,10 @@ local state = {
     draw_status = "not drawn yet",
     dev_last_id = 0,
     dev_status = "",
+    spawn_hook_attempted = false,
+    spawn_hook_status = "not installed",
+    spawn_hook_events = {},
+    spawn_hook_dirty = false,
 }
 
 local function get_current_scene()
@@ -538,6 +544,92 @@ local function collect_method_signatures()
         end)
     end
     state.method_signatures = table.concat(lines, "\n")
+end
+
+local function describe_hook_arg(arg)
+    local out = {}
+    pcall(function() out.i64 = safe_string(sdk.to_int64(arg)) end)
+    pcall(function()
+        local obj = sdk.to_managed_object(arg)
+        if not obj then return end
+        out.managed = true
+        pcall(function()
+            local td = obj:get_type_definition()
+            out.type = td and td:get_full_name() or ""
+        end)
+        pcall(function()
+            local text = obj:call("ToString")
+            if text then out.text = safe_string(text) end
+        end)
+    end)
+    return out
+end
+
+local function push_spawn_hook_event(method_name, args)
+    local event = {
+        time_ms = now_ms(),
+        scene = get_current_scene(),
+        method = method_name,
+        args = {},
+    }
+    for i = 1, 10 do
+        local arg = args[i]
+        if arg == nil then break end
+        event.args[i] = describe_hook_arg(arg)
+    end
+    table.insert(state.spawn_hook_events, event)
+    while #state.spawn_hook_events > 20 do
+        table.remove(state.spawn_hook_events, 1)
+    end
+    state.spawn_hook_dirty = true
+    state.spawn_hook_status = "captured " .. method_name
+end
+
+local function dump_spawn_hook_log(force)
+    if not force and not state.spawn_hook_dirty then return end
+    state.spawn_hook_dirty = false
+    pcall(function()
+        json.dump_file(SPAWN_HOOK_FILE, {
+            time_ms = now_ms(),
+            status = state.spawn_hook_status,
+            events = state.spawn_hook_events,
+        })
+    end)
+end
+
+local function install_spawn_observer_hooks()
+    if state.spawn_hook_attempted then return end
+    state.spawn_hook_attempted = true
+
+    local ok, err = pcall(function()
+        local td = sdk.find_type_definition("app.CharacterManager")
+        if not td then
+            state.spawn_hook_status = "CharacterManager type not found"
+            return
+        end
+
+        local installed = 0
+        for _, method in ipairs(td:get_methods()) do
+            local name = method:get_name()
+            if name == "requestSpawn" or name == "requestInstantiateMontage" then
+                local label = name
+                pcall(function() label = method_signature(method) end)
+                sdk.hook(method, function(args)
+                    pcall(function() push_spawn_hook_event(label, args) end)
+                end, function(retval)
+                    return retval
+                end)
+                installed = installed + 1
+            end
+        end
+        state.spawn_hook_status = "installed " .. tostring(installed) .. " CharacterManager observer hooks"
+        dump_spawn_hook_log(true)
+    end)
+
+    if not ok then
+        state.spawn_hook_status = "hook install failed: " .. safe_string(err)
+        dump_spawn_hook_log(true)
+    end
 end
 
 local function collect_player_fields(player)
@@ -1328,6 +1420,8 @@ local function write_dev_result(id, ok, message)
             native_mode = (state.status or {}).mode or "",
             remote_samples = #state.remote_samples,
             draw = state.draw_status,
+            spawn_hook_status = state.spawn_hook_status,
+            spawn_hook_events = #state.spawn_hook_events,
         })
     end)
 end
@@ -1365,6 +1459,9 @@ local function poll_dev_command()
         state.remote_samples = {}
         state.remote_last_seq = nil
         message = "remote samples cleared"
+    elseif action == "spawn_hook_status" then
+        dump_spawn_hook_log(true)
+        message = state.spawn_hook_status .. " events=" .. tostring(#state.spawn_hook_events)
     elseif action == "host" then
         send_command("host")
         message = "host command sent"
@@ -1662,6 +1759,7 @@ local function draw_main_window()
     if state.dev_status ~= "" then
         imgui.text("Dev: " .. safe_string(state.dev_status))
     end
+    imgui.text("Spawn hook: " .. safe_string(state.spawn_hook_status))
     if imgui.button("Refresh Spawn Diagnostics") then
         dump_runtime_diagnostics()
     end
@@ -1673,6 +1771,7 @@ end
 
 re.on_frame(function()
     local t = now()
+    install_spawn_observer_hooks()
     if t >= state.last_snapshot_time + 0.033 then
         write_local_snapshot()
         state.last_snapshot_time = t
@@ -1692,6 +1791,10 @@ re.on_frame(function()
     update_local_dummy()
     if cfg.auto_runtime_diagnostics and state.local_ok then
         dump_runtime_diagnostics()
+    end
+    if t >= state.last_spawn_hook_dump + 1.0 then
+        dump_spawn_hook_log(false)
+        state.last_spawn_hook_dump = t
     end
     apply_remote_pose()
 end)
