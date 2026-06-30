@@ -22,7 +22,7 @@ Prerequisites:
 - Resident Evil Requiem on Steam, currently tested against AppID `3764200`, BuildID `23634047`, `re9.exe` `1.3.1.0`.
 - Visual Studio 2022 with C++ build tools and CMake.
 - PowerShell. Run deploy scripts from an elevated PowerShell if your RE9 install is under `C:\Program Files (x86)`.
-- Tailscale or another LAN-like overlay if the two PCs are not in the same network.
+- Tailscale if the two PCs are not in the same network. This is the recommended setup.
 
 ```powershell
 git clone https://github.com/quirinklr/Resident-Evil-Requiem-Multiplayer.git
@@ -32,6 +32,83 @@ cmake --build build --config Release
 ```
 
 On this machine CMake selects `Visual Studio 17 2022`.
+
+## Tailscale setup
+
+Tailscale makes both PCs behave like they are on the same private LAN, even if they are in different houses. The mod still uses the host player's PC as the server. There is no public relay or Steamworks lobby in this mod.
+
+Do this on both PCs:
+
+```powershell
+.\scripts\install_tailscale.ps1
+```
+
+If Tailscale reports `NeedsLogin`, run:
+
+```powershell
+& "C:\Program Files\Tailscale\tailscale.exe" up
+```
+
+That command prints a `https://login.tailscale.com/a/...` link. Open it in the browser and log in.
+
+Both players must be in the same Tailnet:
+
+- Fastest test: both players log into Tailscale with the same account.
+- Cleaner setup: host opens the Tailscale admin console, invites the friend, and the friend accepts the invite.
+- After login, both PCs should show each other in Tailscale.
+
+Exact invite flow:
+
+1. Host opens <https://login.tailscale.com/admin/machines>.
+2. Host confirms their own PC appears under `Machines`.
+3. Host opens `Users`.
+4. Host clicks `Invite users`.
+5. Host enters the friend's email address and sends the invite.
+6. Friend opens the invite email and accepts it.
+7. Friend installs Tailscale:
+
+   ```powershell
+   winget install --id Tailscale.Tailscale --exact
+   ```
+
+8. Friend logs into Tailscale with the invited account:
+
+   ```powershell
+   & "C:\Program Files\Tailscale\tailscale.exe" up
+   ```
+
+9. Host refreshes `Machines`; both `Quirin` and the friend's PC should be listed.
+
+If the host only sees the `Add your first device` card after logging in, refresh the page after `tailscale up` succeeds. The device is only added after the desktop client is authenticated, not just after signing into the website.
+
+Verify on both PCs:
+
+```powershell
+& "C:\Program Files\Tailscale\tailscale.exe" status
+& "C:\Program Files\Tailscale\tailscale.exe" ip -4
+```
+
+Expected result:
+
+- `status` lists both machines.
+- `ip -4` prints a `100.x.x.x` address.
+- The host's RE9MP join code should also start with that `100.x.x.x` address.
+
+On the host PC only, allow inbound UDP `27777`:
+
+```powershell
+.\scripts\setup_firewall.ps1
+```
+
+Run this from an elevated PowerShell if Windows asks for administrator rights. With Tailscale, no router port forwarding is expected.
+
+To open an elevated PowerShell quickly:
+
+1. Press `Start`.
+2. Type `PowerShell`.
+3. Right-click `PowerShell`.
+4. Click `Run as administrator`.
+5. `cd` into this repository and run `.\scripts\setup_firewall.ps1`.
 
 ## Deploy
 
@@ -51,13 +128,26 @@ If RE9 is installed somewhere else, pass the install path to both scripts:
 
 ## Usage
 
-1. Both players start RE9 and manually load the same area.
-2. Host opens the REFramework overlay and clicks `Host Lobby`.
-3. Host sends the displayed join code to the client over Tailscale.
-4. Client pastes the join code and clicks `Join`.
-5. If BuildID, EXE version, or scene differ, the connection is denied and the overlay shows why.
+1. Both players install and log into Tailscale.
+2. Both players verify `tailscale status` shows both machines.
+3. Both players build and deploy the mod.
+4. Both players start RE9 and manually load the same area.
+5. Host opens the REFramework overlay, usually with `Insert`.
+6. Host opens `RE9 Multiplayer MVP` and clicks `Host Lobby`.
+7. Host sends the displayed join code to the client. It should look like `100.x.x.x:27777:<token>`.
+8. Client pastes the join code and clicks `Join`.
+9. If BuildID, EXE version, or scene differ, the connection is denied and the overlay shows why.
 
-The host must allow inbound UDP `27777` in Windows Firewall. With Tailscale, no router port forwarding is expected.
+## Troubleshooting
+
+- Tailscale app is not visible: run `& "C:\Program Files\Tailscale\tailscale.exe" up` from PowerShell.
+- `tailscale` command is not found: use the full path `C:\Program Files\Tailscale\tailscale.exe`.
+- `BackendState` is `NeedsLogin`: open the login URL printed by `tailscale up`.
+- Join code does not start with `100.`: Tailscale is probably not logged in or connected.
+- Client cannot connect: host should run `.\scripts\setup_firewall.ps1` and allow UDP `27777`.
+- Overlay shows scene mismatch: both players must manually load the same area before joining.
+- Overlay shows BuildID or EXE mismatch: both players must update RE9 to the same Steam build.
+- Overlay opens but no remote Grace appears: send the host's and client's `Puppet:` and `Clone candidates:` lines from the overlay. The network path is separate from the RE9 runtime clone/spawn probe.
 
 ## Local install check
 
