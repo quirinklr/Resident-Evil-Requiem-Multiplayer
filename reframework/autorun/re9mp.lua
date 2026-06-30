@@ -65,6 +65,8 @@ local state = {
     clone_candidates = "",
     scene_candidates = "",
     component_summary = "",
+    method_signatures = "",
+    player_fields = "",
     last_diagnostic_dump = 0,
 }
 
@@ -400,6 +402,79 @@ local function collect_methods_from_type(type_name, patterns, limit)
     return names
 end
 
+local function method_signature(method)
+    local parts = {}
+    local ok = pcall(function()
+        local ret = method:get_return_type()
+        local ret_name = ret and ret:get_full_name() or "?"
+        table.insert(parts, ret_name .. " " .. method:get_name() .. "(")
+        local params = method:get_params()
+        local ptxt = {}
+        if params then
+            for _, p in ipairs(params) do
+                local ptype = p.t and p.t:get_full_name() or "?"
+                local pname = p.name or "arg"
+                table.insert(ptxt, ptype .. " " .. pname)
+            end
+        end
+        table.insert(parts, table.concat(ptxt, ", "))
+        table.insert(parts, ")")
+    end)
+    if not ok then
+        return method:get_name() .. "(?)"
+    end
+    return table.concat(parts, "")
+end
+
+local function collect_method_signatures()
+    local targets = {
+        {"app.CharacterManager", {"requestSpawn", "requestInstantiateMontage", "getSpawnDataRef", "getSpawnedContextRefList", "getSpawnableContextList"}},
+        {"via.GameObject", {"create", "createComponent"}},
+        {"via.Scene", {"findGameObject", "findGameObjects", "findGameObjectsWithTag"}},
+        {"via.SceneManager", {"get_MainScene", "get_CurrentScene"}},
+    }
+    local lines = {}
+    for _, target in ipairs(targets) do
+        local type_name = target[1]
+        local wanted = target[2]
+        pcall(function()
+            local td = sdk.find_type_definition(type_name)
+            if not td then return end
+            for _, method in ipairs(td:get_methods()) do
+                local name = method:get_name()
+                for _, want in ipairs(wanted) do
+                    if name == want then
+                        table.insert(lines, type_name .. "." .. method_signature(method))
+                        break
+                    end
+                end
+            end
+        end)
+    end
+    state.method_signatures = table.concat(lines, "\n")
+end
+
+local function collect_player_fields(player)
+    local lines = {}
+    pcall(function()
+        local td = player:get_type_definition()
+        if not td then return end
+        for _, field in ipairs(td:get_fields()) do
+            local name = field:get_name()
+            local ftype = field:get_type()
+            local type_name = ftype and ftype:get_full_name() or "?"
+            if name and (name:find("Spawn") or name:find("spawn")
+                    or name:find("Context") or name:find("context")
+                    or name:find("ID") or name:find("Id")
+                    or name:find("User") or name:find("user")
+                    or name:find("Character") or name:find("character")) then
+                table.insert(lines, type_name .. " " .. name)
+            end
+        end
+    end)
+    state.player_fields = table.concat(lines, "\n")
+end
+
 local function collect_scene_candidates()
     local patterns = {
         "create", "Create", "spawn", "Spawn", "instantiate", "Instantiate",
@@ -451,8 +526,10 @@ local function dump_runtime_diagnostics()
     if refs.valid and refs.go then
         collect_clone_candidates(refs.go)
         collect_component_summary(refs.go)
+        collect_player_fields(refs.player)
     end
     collect_scene_candidates()
+    collect_method_signatures()
 
     pcall(function()
         json.dump_file(DATA_PREFIX .. "runtime_diagnostics.json", {
@@ -463,6 +540,8 @@ local function dump_runtime_diagnostics()
             clone_candidates = state.clone_candidates,
             scene_candidates = state.scene_candidates,
             component_summary = state.component_summary,
+            method_signatures = state.method_signatures,
+            player_fields = state.player_fields,
         })
     end)
 end
@@ -699,6 +778,9 @@ local function draw_main_window()
     end
     if state.scene_candidates ~= "" then
         imgui.text("Scene candidates: " .. state.scene_candidates)
+    end
+    if state.method_signatures ~= "" then
+        imgui.text("Method signatures dumped to runtime_diagnostics.json")
     end
     if imgui.button("Spawn Puppet Probe") then try_spawn_puppet() end
     imgui.same_line()
