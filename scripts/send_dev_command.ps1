@@ -2,7 +2,8 @@ param(
     [string]$GameDir = "C:\Program Files (x86)\Steam\steamapps\common\RESIDENT EVIL requiem BIOHAZARD requiem",
     [Parameter(Mandatory = $true)]
     [string]$Action,
-    [bool]$Value = $true
+    [bool]$Value = $true,
+    [string]$Text = ""
 )
 
 $dataDir = Join-Path $GameDir "reframework\data\re9mp"
@@ -16,6 +17,7 @@ $payload = [ordered]@{
     id = $id
     action = $Action
     value = $Value
+    text = $Text
 }
 
 $payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $commandFile -Encoding UTF8

@@ -9,6 +9,7 @@ local COMMAND_FILE = DATA_PREFIX .. "command.json"
 local DEV_COMMAND_FILE = DATA_PREFIX .. "dev_command.json"
 local DEV_RESULT_FILE = DATA_PREFIX .. "dev_result.json"
 local SPAWN_HOOK_FILE = DATA_PREFIX .. "spawn_hook_log.json"
+local RESOURCE_PROBE_FILE = DATA_PREFIX .. "resource_probe.json"
 local LOCAL_FILE = DATA_PREFIX .. "local_snapshot.json"
 local STATUS_FILE = DATA_PREFIX .. "status.json"
 local REMOTE_FILE = DATA_PREFIX .. "remote_snapshot.json"
@@ -84,6 +85,7 @@ local state = {
     component_summary = "",
     method_signatures = "",
     player_fields = "",
+    player_methods = "",
     prefab_hints = "",
     prefab_hint_paths = {},
     prefab_hint_objects = {},
@@ -98,6 +100,10 @@ local state = {
     spawn_hook_status = "not installed",
     spawn_hook_events = {},
     spawn_hook_dirty = false,
+    resource_probe_status = "",
+    character_object_probe = "",
+    last_spawn_context = nil,
+    last_spawn_context_text = "",
 }
 
 local function get_current_scene()
@@ -520,7 +526,12 @@ end
 
 local function collect_method_signatures()
     local targets = {
-        {"app.CharacterManager", {"requestSpawn", "requestInstantiateMontage", "getSpawnDataRef", "getSpawnedContextRefList", "getSpawnableContextList"}},
+        {"app.CharacterManager", {
+            "requestSpawn", "requestInstantiateMontage", "getSpawnDataRef", "getSpawnedContextRefList",
+            "getSpawnableContextList", "getPlayerContextID", "getPlayerContextRef", "getPlayerContextRefFast",
+            "getContextRef", "getManagedContextID", "readyContext", "registerPlayerContextIDList",
+        }},
+        {"via.Prefab", {"instantiate"}},
         {"via.GameObject", {"create", "createComponent"}},
         {"via.Scene", {"findGameObject", "findGameObjects", "findGameObjectsWithTag"}},
         {"via.SceneManager", {"get_MainScene", "get_CurrentScene"}},
@@ -653,6 +664,26 @@ local function collect_player_fields(player)
     state.player_fields = table.concat(lines, "\n")
 end
 
+local function collect_player_methods(player)
+    local lines = {}
+    pcall(function()
+        local td = player and player:get_type_definition()
+        if not td then return end
+        local n = 0
+        for _, method in ipairs(td:get_methods()) do
+            local name = method:get_name() or ""
+            if name:find("Context") or name:find("ID") or name:find("Id")
+                or name:find("Kind") or name:find("Character") or name:find("Spawn")
+                or name:find("Player") then
+                table.insert(lines, method_signature(method))
+                n = n + 1
+                if n >= 50 then break end
+            end
+        end
+    end)
+    state.player_methods = table.concat(lines, "\n")
+end
+
 local function collect_scene_candidates()
     local patterns = {
         "create", "Create", "spawn", "Spawn", "instantiate", "Instantiate",
@@ -719,6 +750,50 @@ local function normalize_prefab_path(text)
     path = path:gsub("^%s+", ""):gsub("%s+$", "")
     path = path:gsub("^natives/%w%w%w/", "")
     return path
+end
+
+local DEFAULT_GRACE_PREFAB_PATHS = {
+    "character/ch/ch01/0100/01/ch0100_01_000.pfb",
+    "character/ch/ch01/0100/01/ch0100_01_001.pfb",
+    "character/ch/ch01/0100/01/ch0100_01_003.pfb",
+    "character/ch/ch01/0100/01/ch0100_01_004.pfb",
+    "character/ch/ch01/0100/01/ch0100_01_005.pfb",
+    "character/ch/ch01/0100/01/ch0100_01_006.pfb",
+    "character/ch/ch01/0100/01/ch0100_01_007.pfb",
+    "character/ch/ch01/0100/01/ch0100_01_008.pfb",
+    "character/ch/ch01/0100/01/ch0100_01_009.pfb",
+    "character/ch/ch01/0100/01/ch0100_01_010.pfb",
+    "character/ch/ch01/0100/01/ch0100_01_100.pfb",
+    "character/ch/ch01/0100/01/ch0100_01_102.pfb",
+}
+
+local function resource_path_variants(path)
+    local variants = {}
+    local function add(value)
+        if not value or value == "" then return end
+        value = tostring(value):gsub("\\", "/"):gsub("^%s+", ""):gsub("%s+$", "")
+        add_unique(variants, value, 32)
+    end
+
+    local raw = tostring(path or "")
+    local no_native = raw:gsub("\\", "/"):gsub("^natives/%w%w%w/", "")
+    local no_version = no_native:gsub("%.pfb%.%d+%.x64$", ".pfb"):gsub("%.pfb%.%d+$", ".pfb")
+    local no_ext = no_version:gsub("%.pfb$", "")
+
+    add(raw)
+    add(no_native)
+    add(no_version)
+    add("natives/stm/" .. no_version)
+    add(no_version .. ".18")
+    add("natives/stm/" .. no_version .. ".18")
+    add(no_ext)
+    add("natives/stm/" .. no_ext)
+
+    local lower_count = #variants
+    for i = 1, lower_count do
+        add(tostring(variants[i]):lower())
+    end
+    return variants
 end
 
 local function is_effect_prefab_path(path)
@@ -887,6 +962,37 @@ local function type_static_lines(type_name, limit)
     return lines
 end
 
+local function get_static_field_value(type_name, names)
+    local value = nil
+    pcall(function()
+        local td = sdk.find_type_definition(type_name)
+        if not td then return end
+        for _, field in ipairs(td:get_fields()) do
+            if not field:is_static() then goto continue end
+            local fname = field:get_name() or ""
+            for _, want in ipairs(names) do
+                if fname == want or fname == ("<" .. want .. ">k__BackingField") then
+                    pcall(function() value = field:get_data(nil) end)
+                    return
+                end
+            end
+            ::continue::
+        end
+    end)
+    return value
+end
+
+local function describe_value_for_probe(label, value)
+    local parts = { label .. "=" .. safe_string(value) }
+    pcall(function()
+        if value and value.get_type_definition then
+            local td = value:get_type_definition()
+            table.insert(parts, "type=" .. (td and td:get_full_name() or "?"))
+        end
+    end)
+    return table.concat(parts, " ")
+end
+
 local function object_field_summary(label, obj, limit)
     local lines = {}
     if not obj or not obj.get_type_definition then return lines end
@@ -912,6 +1018,64 @@ local function object_field_summary(label, obj, limit)
                 n = n + 1
                 if n >= (limit or 28) then break end
             end
+        end
+    end)
+    return lines
+end
+
+local function object_all_field_summary(label, obj, limit)
+    local lines = {}
+    if not obj or not obj.get_type_definition then return lines end
+    pcall(function()
+        local td = obj:get_type_definition()
+        table.insert(lines, label .. " all-fields type=" .. (td and td:get_full_name() or "?"))
+        if not td then return end
+        local n = 0
+        for _, field in ipairs(td:get_fields()) do
+            local name = field:get_name() or ""
+            local ftype = field:get_type()
+            local type_name = ftype and ftype:get_full_name() or "?"
+            local value = nil
+            pcall(function() value = obj:get_field(name) end)
+            table.insert(lines, "  " .. type_name .. " " .. name .. " = " .. safe_string(value))
+            n = n + 1
+            if n >= (limit or 32) then break end
+        end
+    end)
+    return lines
+end
+
+local function object_method_summary(label, obj, patterns, limit)
+    local lines = {}
+    pcall(function()
+        local td = obj and obj:get_type_definition()
+        if not td then return end
+        local n = 0
+        for _, method in ipairs(td:get_methods()) do
+            local name = method:get_name() or ""
+            for _, pattern in ipairs(patterns or {}) do
+                if name:find(pattern) then
+                    table.insert(lines, label .. "." .. method_signature(method))
+                    n = n + 1
+                    break
+                end
+            end
+            if n >= (limit or 32) then break end
+        end
+    end)
+    return lines
+end
+
+local function object_all_method_summary(label, obj, limit)
+    local lines = {}
+    pcall(function()
+        local td = obj and obj:get_type_definition()
+        if not td then return end
+        local n = 0
+        for _, method in ipairs(td:get_methods()) do
+            table.insert(lines, label .. "." .. method_signature(method))
+            n = n + 1
+            if n >= (limit or 48) then break end
         end
     end)
     return lines
@@ -968,6 +1132,7 @@ local function dump_runtime_diagnostics()
         collect_clone_candidates(refs.go)
         collect_component_summary(refs.go)
         collect_player_fields(refs.player)
+        collect_player_methods(refs.player)
     end
     collect_prefab_hints(refs)
     collect_character_spawn_diagnostics(refs)
@@ -985,6 +1150,7 @@ local function dump_runtime_diagnostics()
             component_summary = state.component_summary,
             method_signatures = state.method_signatures,
             player_fields = state.player_fields,
+            player_methods = state.player_methods,
             prefab_hints = state.prefab_hints,
             prefab_hint_paths = state.prefab_hint_paths,
             character_spawn_status = state.character_spawn_status,
@@ -992,6 +1158,421 @@ local function dump_runtime_diagnostics()
             last_spawn_components = state.last_spawn_components,
         })
     end)
+end
+
+local function append_iterable_summary(lines, label, obj, limit)
+    table.insert(lines, label .. "=" .. safe_string(obj))
+    if not obj then return end
+
+    local type_name = ""
+    pcall(function()
+        if obj.get_type_definition then
+            local td = obj:get_type_definition()
+            type_name = td and td:get_full_name() or "?"
+            table.insert(lines, label .. " type=" .. type_name)
+        end
+    end)
+
+    local count = nil
+    pcall(function() count = obj:call("get_Count") end)
+    if count then table.insert(lines, label .. " count=" .. tostring(count)) end
+
+    -- RE Engine dictionary get_Item expects a key, not a numeric index. Do not
+    -- probe it as an array; invalid key types can throw noisy native errors.
+    if type_name:find("Dictionary", 1, true) then
+        return
+    end
+
+    if count then
+        for i = 0, math.min((tonumber(count) or 0) - 1, (limit or 8) - 1) do
+            pcall(function()
+                local item = obj:call("get_Item", i)
+                table.insert(lines, label .. "[" .. tostring(i) .. "]=" .. safe_string(item))
+                for _, line in ipairs(object_field_summary(label .. "[" .. tostring(i) .. "]", item, 18)) do
+                    table.insert(lines, line)
+                end
+            end)
+        end
+        return
+    end
+
+    local direct_iterated = false
+    pcall(function()
+        for i = 0, (limit or 8) - 1 do
+            local moved = obj:call("MoveNext")
+            if not moved then break end
+            direct_iterated = true
+            local item = obj:call("get_Current")
+            table.insert(lines, label .. "[" .. tostring(i) .. "]=" .. safe_string(item))
+            for _, line in ipairs(object_field_summary(label .. "[" .. tostring(i) .. "]", item, 18)) do
+                table.insert(lines, line)
+            end
+        end
+    end)
+    if direct_iterated then return end
+
+    pcall(function()
+        local iter = obj:call("GetEnumerator")
+        if not iter then return end
+        for i = 0, (limit or 8) - 1 do
+            local moved = iter:call("MoveNext")
+            if not moved then break end
+            local item = iter:call("get_Current")
+            table.insert(lines, label .. "[" .. tostring(i) .. "]=" .. safe_string(item))
+            for _, line in ipairs(object_field_summary(label .. "[" .. tostring(i) .. "]", item, 18)) do
+                table.insert(lines, line)
+            end
+        end
+    end)
+end
+
+local function run_character_object_probe()
+    local refs = get_local_player_refs()
+    if refs.valid and refs.go then
+        collect_player_fields(refs.player)
+        collect_player_methods(refs.player)
+        collect_component_summary(refs.go)
+    end
+    collect_method_signatures()
+
+    local context_empty = get_static_field_value("app.ContextID", {"Empty"})
+    local kind_grace = get_static_field_value("app.CharacterKindID", {"cp_A100"})
+    local montage_invalid = get_static_field_value("app.MontageID", {"Invalid"})
+    local purpose_default = get_static_field_value("app.CharacterUsePurposeFlag", {"Default"}) or 0
+    local lines = {
+        "local_player=" .. tostring(refs.valid),
+        describe_value_for_probe("ContextID.Empty", context_empty),
+        describe_value_for_probe("CharacterKindID.cp_A100", kind_grace),
+        describe_value_for_probe("MontageID.Invalid", montage_invalid),
+        describe_value_for_probe("CharacterUsePurposeFlag.Default", purpose_default),
+    }
+    for _, line in ipairs(object_all_field_summary("ContextID.Empty", context_empty, 32)) do
+        table.insert(lines, line)
+    end
+    for _, line in ipairs(object_all_method_summary("ContextID.Empty", context_empty, 48)) do
+        table.insert(lines, line)
+    end
+
+    local spawn_data_status = "not tried"
+    local char_mgr = sdk.get_managed_singleton("app.CharacterManager")
+    if char_mgr and context_empty then
+        local ok, result_or_err = pcall(function()
+            return char_mgr:call("getSpawnDataRef(app.ContextID)", context_empty)
+                or char_mgr:call("getSpawnDataRef", context_empty)
+        end)
+        if ok and result_or_err then
+            spawn_data_status = "getSpawnDataRef(ContextID.Empty) returned " .. safe_string(result_or_err)
+            for _, line in ipairs(object_field_summary("SpawnData.Empty", result_or_err, 28)) do
+                table.insert(lines, line)
+            end
+        else
+            spawn_data_status = ok and "getSpawnDataRef(ContextID.Empty) returned nil" or ("getSpawnDataRef failed: " .. safe_string(result_or_err))
+        end
+    end
+    table.insert(lines, spawn_data_status)
+
+    if char_mgr then
+        if state.last_spawn_context then
+            table.insert(lines, "LastSpawnContext=" .. safe_string(state.last_spawn_context_text))
+            for _, call_name in ipairs({
+                "isUsedContext(app.ContextID)",
+                "isUsedContext",
+                "getContextRef(app.ContextID)",
+                "getContextRef",
+                "getSpawnDataRef(app.ContextID)",
+                "getSpawnDataRef",
+            }) do
+                local ok, result = pcall(function()
+                    return char_mgr:call(call_name, state.last_spawn_context)
+                end)
+                table.insert(lines, call_name .. "(LastSpawnContext) -> " .. (ok and safe_string(result) or ("ERR " .. safe_string(result))))
+                if ok and result and tostring(call_name):find("getContextRef") then
+                    for _, line in ipairs(object_field_summary("LastSpawnContext.Context", result, 40)) do
+                        table.insert(lines, line)
+                    end
+                    for _, line in ipairs(object_method_summary("LastSpawnContext.Context", result, {"GameObject", "Transform", "Context", "Update", "Spawn"}, 60)) do
+                        table.insert(lines, line)
+                    end
+                end
+            end
+        end
+
+        table.insert(lines, "CharacterManager methods: " .. table.concat(collect_methods_from_type("app.CharacterManager", {"Player", "Context", "Spawn", "Montage", "Owner"}, 120), ", "))
+        for _, line in ipairs(object_field_summary("CharacterManager", char_mgr, 80)) do
+            table.insert(lines, line)
+        end
+
+        local player_context_id = nil
+        if kind_grace then
+            for _, call_name in ipairs({
+                "getPlayerContextID(app.CharacterKindID)",
+                "getPlayerContextID",
+            }) do
+                local ok, result = pcall(function()
+                    return char_mgr:call(call_name, kind_grace)
+                end)
+                table.insert(lines, call_name .. "(cp_A100) -> " .. (ok and safe_string(result) or ("ERR " .. safe_string(result))))
+                if ok and result and not player_context_id then player_context_id = result end
+            end
+        end
+        if player_context_id then
+            table.insert(lines, describe_value_for_probe("PlayerContextID.cp_A100", player_context_id))
+            for _, context_probe in ipairs({
+                {"PlayerContextID.cp_A100", player_context_id},
+                {"ContextID.Empty", context_empty},
+            }) do
+                local ctx_label, ctx = context_probe[1], context_probe[2]
+                if ctx then
+                    for _, call_name in ipairs({
+                        "isUsedContext(app.ContextID)",
+                        "isUsedContext",
+                        "getManagedContextID(app.ContextID)",
+                        "getManagedContextID",
+                        "getContextRef(app.ContextID)",
+                        "getContextRef",
+                        "getPlayerContextRef(app.ContextID)",
+                        "getPlayerContextRef",
+                    }) do
+                        local ok, result = pcall(function()
+                            return char_mgr:call(call_name, ctx)
+                        end)
+                        table.insert(lines, call_name .. "(" .. ctx_label .. ") -> " .. (ok and safe_string(result) or ("ERR " .. safe_string(result))))
+                    end
+                end
+            end
+            local ok, result = pcall(function()
+                return char_mgr:call("getSpawnDataRef(app.ContextID)", player_context_id)
+                    or char_mgr:call("getSpawnDataRef", player_context_id)
+            end)
+            table.insert(lines, "getSpawnDataRef(PlayerContextID.cp_A100) -> " .. (ok and safe_string(result) or ("ERR " .. safe_string(result))))
+            if ok and result then
+                for _, line in ipairs(object_field_summary("SpawnData.Player.cp_A100", result, 40)) do
+                    table.insert(lines, line)
+                end
+                for _, line in ipairs(object_all_field_summary("SpawnData.Player.cp_A100", result, 80)) do
+                    table.insert(lines, line)
+                end
+                for _, line in ipairs(object_all_method_summary("SpawnData.Player.cp_A100", result, 80)) do
+                    table.insert(lines, line)
+                end
+            end
+        end
+
+        for _, field_info in ipairs({
+            {"Field.PlayerContextList", "<PlayerContextList>k__BackingField"},
+            {"Field.SpawnableContextList", "<SpawnableContextList>k__BackingField"},
+            {"Field.PlayerContextIDHolder", "<PlayerContextIDHolder>k__BackingField"},
+            {"Field.CharacterPool", "<CharacterPool>k__BackingField"},
+            {"Field.CharacterSpawnDataDB", "<CharacterSpawnDataDB>k__BackingField"},
+            {"Field.CharacterContextDB", "<CharacterContextDB>k__BackingField"},
+        }) do
+            pcall(function()
+                local field_value = char_mgr:get_field(field_info[2])
+                append_iterable_summary(lines, field_info[1], field_value, 12)
+                if field_info[1] == "Field.PlayerContextIDHolder" and field_value then
+                    local count = nil
+                    pcall(function() count = field_value:call("get_Count") end)
+                    if count then
+                        for i = 0, math.min((tonumber(count) or 0) - 1, 3) do
+                            local item = nil
+                            pcall(function() item = field_value:call("get_Item", i) end)
+                            for _, line in ipairs(object_all_field_summary(field_info[1] .. "[" .. tostring(i) .. "]", item, 32)) do
+                                table.insert(lines, line)
+                            end
+                            for _, line in ipairs(object_all_method_summary(field_info[1] .. "[" .. tostring(i) .. "]", item, 48)) do
+                                table.insert(lines, line)
+                            end
+                            for _, line in ipairs(object_method_summary(field_info[1] .. "[" .. tostring(i) .. "]", item, {"Context", "ID", "Reserve", "Use", "Used", "Get", "Next", "Create"}, 36)) do
+                                table.insert(lines, line)
+                            end
+                        end
+                    end
+                elseif field_info[1] == "Field.CharacterPool" and field_value then
+                    local count = nil
+                    pcall(function() count = field_value:call("get_Count") end)
+                    if count then
+                        for i = 0, math.min((tonumber(count) or 0) - 1, 5) do
+                            local item = nil
+                            pcall(function() item = field_value:call("get_Item", i) end)
+                            for _, line in ipairs(object_all_field_summary(field_info[1] .. "[" .. tostring(i) .. "]", item, 24)) do
+                                table.insert(lines, line)
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+
+        pcall(function()
+            append_iterable_summary(lines, "SpawnedContextRefList", char_mgr:call("getSpawnedContextRefList"), 8)
+        end)
+        pcall(function()
+            append_iterable_summary(lines, "SpawnableContextList", char_mgr:call("getSpawnableContextList"), 12)
+        end)
+    end
+
+    state.character_object_probe = table.concat(lines, "\n")
+    pcall(function()
+        json.dump_file(DATA_PREFIX .. "character_probe.json", {
+            time_ms = now_ms(),
+            scene = get_current_scene(),
+            local_ok = refs.valid,
+            status = spawn_data_status,
+            values = lines,
+            player_fields = state.player_fields,
+            player_methods = state.player_methods,
+            component_summary = state.component_summary,
+            method_signatures = state.method_signatures,
+        })
+    end)
+    return true, spawn_data_status
+end
+
+local function run_request_spawn_empty_context()
+    local char_mgr = sdk.get_managed_singleton("app.CharacterManager")
+    if not char_mgr then
+        state.character_spawn_status = "requestSpawn object probe failed: CharacterManager not found"
+        return false, state.character_spawn_status
+    end
+
+    local context_empty = get_static_field_value("app.ContextID", {"Empty"})
+    local kind_grace = get_static_field_value("app.CharacterKindID", {"cp_A100"})
+    local montage_invalid = get_static_field_value("app.MontageID", {"Invalid"})
+    local purpose_default = get_static_field_value("app.CharacterUsePurposeFlag", {"Default"}) or 0
+    if not context_empty or not kind_grace or not montage_invalid then
+        state.character_spawn_status = "requestSpawn object probe failed: missing ContextID/Kind/Montage"
+        return false, state.character_spawn_status
+    end
+
+    local ok, err = pcall(function()
+        char_mgr:call(
+            "requestSpawn(app.ContextID, app.CharacterKindID, app.MontageID, System.Int32, System.Boolean, app.CharacterUsePurposeFlag)",
+            context_empty,
+            kind_grace,
+            montage_invalid,
+            0,
+            false,
+            purpose_default
+        )
+    end)
+
+    dump_spawn_hook_log(true)
+    if ok then
+        state.character_spawn_status = "requestSpawn sent with ContextID.Empty/cp_A100 object args"
+        state.puppet_status = "CharacterManager requestSpawn sent; check for new Grace"
+        return true, state.character_spawn_status
+    end
+    state.character_spawn_status = "requestSpawn object probe failed: " .. safe_string(err)
+    state.puppet_status = state.character_spawn_status
+    return false, state.character_spawn_status
+end
+
+local function create_new_context_id()
+    local lines = {}
+    local guid = nil
+    local ctx = nil
+
+    local guid_td = sdk.find_type_definition("System.Guid")
+    if guid_td then
+        for _, method in ipairs(guid_td:get_methods()) do
+            local name = method:get_name() or ""
+            if name == "NewGuid" then
+                local ok, result = pcall(function() return method:call(nil) end)
+                table.insert(lines, "System.Guid.NewGuid -> " .. (ok and safe_string(result) or ("ERR " .. safe_string(result))))
+                if ok and result then guid = result end
+                break
+            end
+        end
+    else
+        table.insert(lines, "System.Guid type not found")
+    end
+
+    local ok_ctx, ctx_or_err = pcall(function()
+        return sdk.create_instance("app.ContextID")
+    end)
+    table.insert(lines, "sdk.create_instance(app.ContextID) -> " .. (ok_ctx and safe_string(ctx_or_err) or ("ERR " .. safe_string(ctx_or_err))))
+    if ok_ctx and ctx_or_err then
+        ctx = ctx_or_err
+        if guid then
+            for _, call_name in ipairs({".ctor(System.Guid)", ".ctor"}) do
+                local ok, err = pcall(function()
+                    ctx:call(call_name, guid)
+                end)
+                table.insert(lines, "ContextID:" .. call_name .. "(guid) -> " .. (ok and "ok" or ("ERR " .. safe_string(err))))
+                if ok then break end
+            end
+        end
+        pcall(function() table.insert(lines, "ContextID.ToString -> " .. safe_string(ctx:call("ToString"))) end)
+        pcall(function() table.insert(lines, "ContextID.get_IsEmpty -> " .. safe_string(ctx:call("get_IsEmpty"))) end)
+        pcall(function() table.insert(lines, "ContextID.get_RawID -> " .. safe_string(ctx:call("get_RawID"))) end)
+    end
+
+    local char_mgr = sdk.get_managed_singleton("app.CharacterManager")
+    if char_mgr and ctx then
+        for _, call_name in ipairs({"isUsedContext(app.ContextID)", "isUsedContext"}) do
+            local ok, result = pcall(function() return char_mgr:call(call_name, ctx) end)
+            table.insert(lines, call_name .. "(new ctx) -> " .. (ok and safe_string(result) or ("ERR " .. safe_string(result))))
+        end
+    end
+
+    return ctx, lines
+end
+
+local function run_context_create_probe()
+    local ctx, lines = create_new_context_id()
+    pcall(function()
+        json.dump_file(DATA_PREFIX .. "context_create_probe.json", {
+            time_ms = now_ms(),
+            scene = get_current_scene(),
+            ok = ctx ~= nil,
+            lines = lines,
+        })
+    end)
+    state.character_spawn_status = table.concat(lines, " | ")
+    return ctx ~= nil, state.character_spawn_status
+end
+
+local function run_request_spawn_new_context()
+    local char_mgr = sdk.get_managed_singleton("app.CharacterManager")
+    if not char_mgr then
+        state.character_spawn_status = "requestSpawn new context failed: CharacterManager not found"
+        return false, state.character_spawn_status
+    end
+
+    local ctx, lines = create_new_context_id()
+    local kind_grace = get_static_field_value("app.CharacterKindID", {"cp_A100"})
+    local montage_invalid = get_static_field_value("app.MontageID", {"Invalid"})
+    local purpose_default = get_static_field_value("app.CharacterUsePurposeFlag", {"Default"}) or 0
+    if not ctx or not kind_grace or not montage_invalid then
+        state.character_spawn_status = "requestSpawn new context failed: missing ContextID/Kind/Montage | " .. table.concat(lines, " | ")
+        return false, state.character_spawn_status
+    end
+
+    pcall(function() ctx = ctx:add_ref() end)
+    state.last_spawn_context = ctx
+    pcall(function() state.last_spawn_context_text = safe_string(ctx:call("ToString")) end)
+
+    local ok, err = pcall(function()
+        char_mgr:call(
+            "requestSpawn(app.ContextID, app.CharacterKindID, app.MontageID, System.Int32, System.Boolean, app.CharacterUsePurposeFlag)",
+            ctx,
+            kind_grace,
+            montage_invalid,
+            0,
+            false,
+            purpose_default
+        )
+    end)
+
+    dump_spawn_hook_log(true)
+    if ok then
+        state.character_spawn_status = "requestSpawn sent with new ContextID " .. safe_string(state.last_spawn_context_text)
+        state.puppet_status = "New ContextID requestSpawn sent; check for Grace"
+        return true, state.character_spawn_status
+    end
+    state.character_spawn_status = "requestSpawn new context failed: " .. safe_string(err)
+    state.puppet_status = state.character_spawn_status
+    return false, state.character_spawn_status
 end
 
 local function disable_puppet_components(go)
@@ -1131,9 +1712,13 @@ local function component_summary_for_go(go, limit)
     return table.concat(names, ", ")
 end
 
-local function looks_like_grace_character(go)
+local function looks_like_grace_character(go, label)
     local summary = component_summary_for_go(go, 90)
     state.last_spawn_components = summary
+    local lower_label = tostring(label or ""):lower()
+    if lower_label:find("character/ch/ch01/0100") or lower_label:find("ch0100_01") then
+        return true
+    end
     return summary:find("app.Cp_A100")
         or summary:find("PlayerMeshController")
         or summary:find("ActorPlayerMeshController")
@@ -1168,7 +1753,7 @@ local function adopt_puppet_from_result(result, label)
         return false
     end
 
-    if go and not looks_like_grace_character(go) then
+    if go and not looks_like_grace_character(go, label) then
         state.puppet_status = "spawned non-character via " .. label
         return false
     end
@@ -1189,18 +1774,23 @@ end
 local function create_prefab_from_path(path)
     path = normalize_prefab_path(path) or path
     if not path or path == "" then return nil, "empty prefab path" end
-    path = tostring(path):gsub("\\", "/"):lower()
 
-    local prefab = nil
-    local ok, err = pcall(function()
-        prefab = sdk.create_resource("via.Prefab", path)
-    end)
-    if not ok then return nil, safe_string(err) end
-    if prefab and prefab.add_ref then
-        pcall(function() prefab = prefab:add_ref() end)
+    local errors = {}
+    for _, candidate in ipairs(resource_path_variants(path)) do
+        local prefab = nil
+        local ok, err = pcall(function()
+            prefab = sdk.create_resource("via.Prefab", candidate)
+        end)
+        if ok and prefab then
+            if prefab.add_ref then
+                pcall(function() prefab = prefab:add_ref() end)
+            end
+            return prefab, candidate
+        end
+        table.insert(errors, candidate .. " -> " .. (ok and "nil" or safe_string(err)))
+        if #errors >= 8 then break end
     end
-    if not prefab then return nil, "sdk.create_resource returned nil for " .. path end
-    return prefab, path
+    return nil, "sdk.create_resource returned nil for " .. table.concat(errors, "; ")
 end
 
 local function try_spawn_prefab_object(prefab, label, refs)
@@ -1212,12 +1802,15 @@ local function try_spawn_prefab_object(prefab, label, refs)
     local before = first_scene_transform()
 
     pcall(function() prefab:call("set_Standby", true) end)
-    local calls = {
-        { name = "instantiate(via.vec3, via.Quaternion, via.Folder)", args = { pos, rot, folder or 0 } },
-        { name = "instantiate(via.vec3, via.Folder)", args = { pos, folder or 0 } },
-        { name = "instantiate(via.vec3, via.Quaternion)", args = { pos, rot } },
-        { name = "instantiate(via.vec3)", args = { pos } },
-    }
+    local calls = {}
+    if folder then
+        table.insert(calls, { name = "instantiate(via.vec3, via.Quaternion, via.Folder)", args = { pos, rot, folder } })
+        table.insert(calls, { name = "instantiate(via.vec3, via.Folder)", args = { pos, folder } })
+        table.insert(calls, { name = "instantiate(via.Folder)", args = { folder } })
+    end
+    table.insert(calls, { name = "instantiate(via.vec3, via.Quaternion)", args = { pos, rot } })
+    table.insert(calls, { name = "instantiate(via.vec3)", args = { pos } })
+    table.insert(calls, { name = "instantiate()", args = {} })
 
     local errors = {}
     for _, call in ipairs(calls) do
@@ -1277,10 +1870,69 @@ local function try_spawn_prefab_candidate(refs)
         end
     end
 
+    for _, path in ipairs(DEFAULT_GRACE_PREFAB_PATHS) do
+        local prefab, created_or_err = create_prefab_from_path(path)
+        if prefab then
+            local ok, err = try_spawn_prefab_object(prefab, path, refs)
+            if ok then return true end
+            table.insert(errors, path .. ": " .. safe_string(err))
+        else
+            table.insert(errors, path .. ": " .. safe_string(created_or_err))
+        end
+    end
+
     if #errors == 0 then
         return false, "no via.Prefab/path hints found on Grace yet"
     end
     return false, errors[1]
+end
+
+local function run_resource_probe(custom_path)
+    local inputs = {}
+    if custom_path and safe_string(custom_path) ~= "" then
+        add_unique(inputs, safe_string(custom_path), 24)
+    end
+    for _, path in ipairs(DEFAULT_GRACE_PREFAB_PATHS) do
+        add_unique(inputs, path, 24)
+    end
+    add_unique(inputs, "vfx/provider/epv_character/epvc_ch_prefab_id/epvc2_cp_a100.pfb", 24)
+    add_unique(inputs, "natives/stm/vfx/provider/epv_character/epvc_ch_prefab_id/epvc2_cp_a100.pfb.18", 24)
+
+    local rows = {}
+    local found = nil
+    for _, input in ipairs(inputs) do
+        local row = { input = input, ok = false, path = "", attempts = {} }
+        for _, candidate in ipairs(resource_path_variants(input)) do
+            local prefab = nil
+            local ok, err = pcall(function()
+                prefab = sdk.create_resource("via.Prefab", candidate)
+            end)
+            local attempt = {
+                path = candidate,
+                ok = ok and prefab ~= nil,
+                error = ok and (prefab and "" or "nil") or safe_string(err),
+            }
+            table.insert(row.attempts, attempt)
+            if attempt.ok then
+                row.ok = true
+                row.path = candidate
+                found = found or candidate
+                break
+            end
+            if #row.attempts >= 8 then break end
+        end
+        table.insert(rows, row)
+    end
+
+    state.resource_probe_status = found and ("found " .. found) or "no via.Prefab resource loaded"
+    pcall(function()
+        json.dump_file(RESOURCE_PROBE_FILE, {
+            time_ms = now_ms(),
+            status = state.resource_probe_status,
+            rows = rows,
+        })
+    end)
+    return found ~= nil, state.resource_probe_status
 end
 
 local function try_character_manager_spawn(refs)
@@ -1462,6 +2114,31 @@ local function poll_dev_command()
     elseif action == "spawn_hook_status" then
         dump_spawn_hook_log(true)
         message = state.spawn_hook_status .. " events=" .. tostring(#state.spawn_hook_events)
+    elseif action == "diagnostics" then
+        dump_runtime_diagnostics()
+        message = "runtime diagnostics dumped"
+    elseif action == "character_probe" then
+        ok, message = run_character_object_probe()
+    elseif action == "spawn_empty_context" then
+        ok = false
+        message = "disabled: empty ContextID can pollute runtime state; use spawn_new_context"
+    elseif action == "spawn_new_context" then
+        ok, message = run_request_spawn_new_context()
+    elseif action == "context_create_probe" then
+        ok, message = run_context_create_probe()
+    elseif action == "set_prefab" then
+        cfg.prefab_path = safe_string(cmd.text or "")
+        save_cfg()
+        message = "prefab_path=" .. cfg.prefab_path
+    elseif action == "resource_probe" then
+        ok, message = run_resource_probe(cmd.text)
+    elseif action == "probe_prefab" then
+        if cmd.text and safe_string(cmd.text) ~= "" then
+            cfg.prefab_path = safe_string(cmd.text)
+            save_cfg()
+        end
+        ok = try_spawn_puppet(false)
+        message = state.puppet_status
     elseif action == "host" then
         send_command("host")
         message = "host command sent"
@@ -1743,6 +2420,9 @@ local function draw_main_window()
     if state.character_spawn_status ~= "" then
         imgui.text("CharacterManager: " .. safe_string(state.character_spawn_status))
     end
+    if state.character_object_probe ~= "" then
+        imgui.text("Character probe dumped to character_probe.json")
+    end
     if state.last_spawn_components ~= "" then
         imgui.text("Last spawn components dumped to runtime_diagnostics.json")
     end
@@ -1755,7 +2435,26 @@ local function draw_main_window()
     if state.method_signatures ~= "" then
         imgui.text("Method signatures dumped to runtime_diagnostics.json")
     end
-    imgui.text_colored("CharacterManager requestSpawn disabled after REFramework AV.", 0xFF8888FF)
+    imgui.text_colored("Numeric requestSpawn path disabled after REFramework AV.", 0xFF8888FF)
+    if state.resource_probe_status ~= "" then
+        imgui.text("Resource probe: " .. safe_string(state.resource_probe_status))
+    end
+    if imgui.button("Probe Grace Resource Paths") then
+        run_resource_probe(cfg.prefab_path)
+    end
+    imgui.same_line()
+    if imgui.button("Probe Character Objects") then
+        run_character_object_probe()
+    end
+    if imgui.button("Probe Grace Prefab/Clone") then
+        try_spawn_puppet(false)
+    end
+    if imgui.button("Try New Context Spawn") then
+        run_request_spawn_new_context()
+    end
+    if imgui.button("Probe New ContextID") then
+        run_context_create_probe()
+    end
     if state.dev_status ~= "" then
         imgui.text("Dev: " .. safe_string(state.dev_status))
     end
