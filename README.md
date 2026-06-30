@@ -81,6 +81,38 @@ Exact invite flow:
 
 If the host only sees the `Add your first device` card after logging in, refresh the page after `tailscale up` succeeds. The device is only added after the desktop client is authenticated, not just after signing into the website.
 
+Important distinction:
+
+- `Users` means the account has joined the Tailnet.
+- `Machines` means a concrete PC is connected to that Tailnet.
+- For RE9MP, the friend's PC must appear under `Machines`. A user entry alone is not enough.
+
+If the friend appears under `Users` but their PC does not appear under `Machines`, they are probably logged into Tailscale on Windows under their own Tailnet/profile. On the friend's PC, run:
+
+```powershell
+& "C:\Program Files\Tailscale\tailscale.exe" switch --list
+```
+
+If a profile for the host Tailnet appears, switch to it:
+
+```powershell
+& "C:\Program Files\Tailscale\tailscale.exe" switch "deinquirin13@gmail.com"
+```
+
+If no host Tailnet profile appears, force a fresh login and select/accept the host Tailnet in the browser:
+
+```powershell
+& "C:\Program Files\Tailscale\tailscale.exe" up --force-reauth
+```
+
+After that, the friend should verify:
+
+```powershell
+& "C:\Program Files\Tailscale\tailscale.exe" status
+```
+
+The output must list both machines, for example `quirin` and the friend's `desktop-*` machine.
+
 Verify on both PCs:
 
 ```powershell
