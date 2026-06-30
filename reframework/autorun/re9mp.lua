@@ -6,6 +6,8 @@ local MOD_VERSION = "0.1.0"
 local DATA_PREFIX = "re9mp/"
 local CFG_FILE = DATA_PREFIX .. "config.json"
 local COMMAND_FILE = DATA_PREFIX .. "command.json"
+local DEV_COMMAND_FILE = DATA_PREFIX .. "dev_command.json"
+local DEV_RESULT_FILE = DATA_PREFIX .. "dev_result.json"
 local LOCAL_FILE = DATA_PREFIX .. "local_snapshot.json"
 local STATUS_FILE = DATA_PREFIX .. "status.json"
 local REMOTE_FILE = DATA_PREFIX .. "remote_snapshot.json"
@@ -57,6 +59,7 @@ local state = {
     last_sample_time = 0,
     last_snapshot_time = 0,
     last_status_time = 0,
+    last_dev_poll = 0,
     status = nil,
     local_snapshot = nil,
     local_ok = false,
@@ -87,6 +90,8 @@ local state = {
     last_spawn_components = "",
     last_diagnostic_dump = 0,
     draw_status = "not drawn yet",
+    dev_last_id = 0,
+    dev_status = "",
 }
 
 local function get_current_scene()
@@ -1307,6 +1312,80 @@ local function despawn_puppet()
     state.puppet_status = "despawned"
 end
 
+local function write_dev_result(id, ok, message)
+    state.dev_status = safe_string(message)
+    pcall(function()
+        json.dump_file(DEV_RESULT_FILE, {
+            id = id or state.dev_last_id,
+            ok = ok and true or false,
+            message = safe_string(message),
+            time_ms = now_ms(),
+            scene = get_current_scene(),
+            local_ok = state.local_ok,
+            local_error = state.local_error,
+            puppet = state.puppet_status,
+            native_state = (state.status or {}).state or "",
+            native_mode = (state.status or {}).mode or "",
+            remote_samples = #state.remote_samples,
+            draw = state.draw_status,
+        })
+    end)
+end
+
+local function poll_dev_command()
+    local cmd = nil
+    pcall(function() cmd = json.load_file(DEV_COMMAND_FILE) end)
+    if not cmd then return end
+
+    local id = tonumber(cmd.id or 0) or 0
+    if id <= (state.dev_last_id or 0) then return end
+    state.dev_last_id = id
+
+    local action = safe_string(cmd.action)
+    local ok, message = true, "ok"
+
+    if action == "status" then
+        message = "status"
+    elseif action == "set_dummy" then
+        cfg.local_dummy = cmd.value and true or false
+        if not cfg.local_dummy then
+            state.remote_samples = {}
+            state.remote_last_seq = nil
+        end
+        save_cfg()
+        message = "local_dummy=" .. tostring(cfg.local_dummy)
+    elseif action == "set_marker" then
+        cfg.draw_remote_marker = cmd.value and true or false
+        save_cfg()
+        message = "draw_remote_marker=" .. tostring(cfg.draw_remote_marker)
+    elseif action == "despawn" then
+        despawn_puppet()
+        message = "despawned"
+    elseif action == "clear_remote" then
+        state.remote_samples = {}
+        state.remote_last_seq = nil
+        message = "remote samples cleared"
+    elseif action == "host" then
+        send_command("host")
+        message = "host command sent"
+    elseif action == "disconnect" then
+        send_command("disconnect")
+        message = "disconnect command sent"
+    elseif action == "stop" then
+        send_command("stop")
+        message = "stop command sent"
+    elseif action == "open_window" then
+        cfg.window_open = cmd.value ~= false
+        save_cfg()
+        message = "window_open=" .. tostring(cfg.window_open)
+    else
+        ok = false
+        message = "unknown or disabled dev action: " .. action
+    end
+
+    write_dev_result(id, ok, message)
+end
+
 local function apply_remote_pose()
     local pose = current_remote_pose()
     if not pose or not pose.valid then return end
@@ -1579,10 +1658,13 @@ local function draw_main_window()
     if state.method_signatures ~= "" then
         imgui.text("Method signatures dumped to runtime_diagnostics.json")
     end
+    imgui.text_colored("CharacterManager requestSpawn disabled after REFramework AV.", 0xFF8888FF)
+    if state.dev_status ~= "" then
+        imgui.text("Dev: " .. safe_string(state.dev_status))
+    end
     if imgui.button("Refresh Spawn Diagnostics") then
         dump_runtime_diagnostics()
     end
-    if imgui.button("Probe CharacterManager Only") then try_character_manager_only() end
     imgui.same_line()
     if imgui.button("Despawn Puppet") then despawn_puppet() end
 
@@ -1602,6 +1684,10 @@ re.on_frame(function()
     if t >= state.remote_read_time + 0.02 then
         read_remote_snapshot()
         state.remote_read_time = t
+    end
+    if t >= state.last_dev_poll + 0.20 then
+        poll_dev_command()
+        state.last_dev_poll = t
     end
     update_local_dummy()
     if cfg.auto_runtime_diagnostics and state.local_ok then

@@ -208,6 +208,19 @@ If RE9 is installed somewhere else, pass the install path to both scripts:
 - Overlay shows BuildID or EXE mismatch: both players must update RE9 to the same Steam build.
 - Overlay opens but no remote Grace appears: send the host's and client's `Puppet:` and `Clone candidates:` lines from the overlay. The network path is separate from the RE9 runtime clone/spawn probe.
 
+### Dev command bridge
+
+After RE9 has loaded `re9mp.lua` once, safe debug commands can be sent without clicking in the REFramework UI:
+
+```powershell
+.\scripts\send_dev_command.ps1 -Action status
+.\scripts\send_dev_command.ps1 -Action set_dummy -Value $true
+.\scripts\send_dev_command.ps1 -Action set_marker -Value $false
+.\scripts\send_dev_command.ps1 -Action despawn
+```
+
+Results are written to `reframework\data\re9mp\dev_result.json` in the RE9 folder. Loading new Lua code still requires one manual `Reset scripts` or a full RE9 restart.
+
 ### Offline remote marker test
 
 This test works without a second PC and checks whether the Lua overlay can draw a remote-player marker in the loaded RE9 scene.
