@@ -817,9 +817,17 @@ local function draw_main_window()
         end
     else
         imgui.text_colored(rr.text, 0xFF8888FF)
+        imgui.text_colored("Offline test: enable Local dummy remote, not Grace spawn probe.", 0xFFAAFFFF)
     end
 
     imgui.separator()
+    if imgui.button("Enable Dummy Marker Test") then
+        cfg.local_dummy = true
+        cfg.draw_remote_marker = true
+        state.remote_samples = {}
+        state.remote_last_seq = nil
+        save_cfg()
+    end
     local auto_changed, auto_val = imgui.checkbox("Auto spawn remote puppet", cfg.auto_spawn_puppet)
     if auto_changed then
         cfg.auto_spawn_puppet = auto_val
@@ -830,7 +838,7 @@ local function draw_main_window()
         cfg.draw_remote_marker = marker_val
         save_cfg()
     end
-    local dummy_changed, dummy_val = imgui.checkbox("Local dummy remote", cfg.local_dummy)
+    local dummy_changed, dummy_val = imgui.checkbox("Local dummy remote (offline marker test)", cfg.local_dummy)
     if dummy_changed then
         cfg.local_dummy = dummy_val
         state.remote_samples = {}
@@ -848,7 +856,7 @@ local function draw_main_window()
     if state.method_signatures ~= "" then
         imgui.text("Method signatures dumped to runtime_diagnostics.json")
     end
-    if imgui.button("Spawn Puppet Probe") then try_spawn_puppet() end
+    if imgui.button("Probe Grace Spawn") then try_spawn_puppet() end
     imgui.same_line()
     if imgui.button("Despawn Puppet") then despawn_puppet() end
 
