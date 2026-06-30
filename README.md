@@ -113,6 +113,33 @@ After that, the friend should verify:
 
 The output must list both machines, for example `quirin` and the friend's `desktop-*` machine.
 
+Browser login fallback with an auth key:
+
+If the Tailscale browser login shows a server error, the host can create a short-lived auth key in the Tailscale admin console. Auth keys register a new device without interactive browser login.
+
+Host steps:
+
+1. Open <https://login.tailscale.com/admin/settings/keys>.
+2. In `Auth keys`, click `Generate auth key`.
+3. Use a safe short-lived key:
+   - `Reusable`: off
+   - `Ephemeral`: off
+   - `Pre-approved`: on, if the option is shown
+   - Expiration: shortest practical value, such as 1 day
+   - Tags: none
+4. Copy the key once and send it only to the friend privately.
+5. Revoke/delete the key after the friend's PC appears in `Machines`.
+
+Friend steps:
+
+```powershell
+& "C:\Program Files\Tailscale\tailscale.exe" logout
+.\scripts\install_tailscale.ps1 -AuthKey "PASTE_KEY_HERE"
+& "C:\Program Files\Tailscale\tailscale.exe" status
+```
+
+Do not commit, screenshot, or paste auth keys into public chats. Treat them like passwords.
+
 Verify on both PCs:
 
 ```powershell

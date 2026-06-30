@@ -1,5 +1,6 @@
 param(
-    [switch]$OpenLogin
+    [switch]$OpenLogin,
+    [string]$AuthKey = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,7 +21,10 @@ if ($service -and $service.Status -ne "Running") {
 
 & $tailscale version
 
-if ($OpenLogin) {
+if ($AuthKey -ne "") {
+    & $tailscale logout 2>$null
+    & $tailscale up --auth-key $AuthKey --reset
+} elseif ($OpenLogin) {
     & $tailscale up
 } else {
     & $tailscale status --json
