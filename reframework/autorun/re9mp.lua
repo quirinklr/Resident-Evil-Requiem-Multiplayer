@@ -18,6 +18,7 @@ local cfg = {
     draw_remote_marker = true,
     local_dummy = false,
     prefab_path = "",
+    auto_runtime_diagnostics = false,
 }
 
 pcall(function()
@@ -1570,6 +1571,9 @@ local function draw_main_window()
     if state.method_signatures ~= "" then
         imgui.text("Method signatures dumped to runtime_diagnostics.json")
     end
+    if imgui.button("Refresh Spawn Diagnostics") then
+        dump_runtime_diagnostics()
+    end
     if imgui.button("Probe Grace Character Spawn") then try_spawn_puppet(true) end
     imgui.same_line()
     if imgui.button("Despawn Puppet") then despawn_puppet() end
@@ -1592,7 +1596,7 @@ re.on_frame(function()
         state.remote_read_time = t
     end
     update_local_dummy()
-    if state.local_ok then
+    if cfg.auto_runtime_diagnostics and state.local_ok then
         dump_runtime_diagnostics()
     end
     apply_remote_pose()
