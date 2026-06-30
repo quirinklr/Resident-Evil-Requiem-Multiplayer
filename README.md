@@ -17,7 +17,16 @@ The network/lobby/snapshot path is complete. The remote Grace visual is best-eff
 
 ## Build
 
+Prerequisites:
+
+- Resident Evil Requiem on Steam, currently tested against AppID `3764200`, BuildID `23634047`, `re9.exe` `1.3.1.0`.
+- Visual Studio 2022 with C++ build tools and CMake.
+- PowerShell. Run deploy scripts from an elevated PowerShell if your RE9 install is under `C:\Program Files (x86)`.
+- Tailscale or another LAN-like overlay if the two PCs are not in the same network.
+
 ```powershell
+git clone https://github.com/quirinklr/Resident-Evil-Requiem-Multiplayer.git
+cd Resident-Evil-Requiem-Multiplayer
 cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
@@ -33,6 +42,13 @@ On this machine CMake selects `Visual Studio 17 2022`.
 
 `update_reframework.ps1` backs up the existing `dinput8.dll`, `reframework_revision.txt`, `ref_ui.ini`, and `reframework` folder before installing REFramework Nightly 01391.
 
+If RE9 is installed somewhere else, pass the install path to both scripts:
+
+```powershell
+.\scripts\update_reframework.ps1 -GameDir "D:\SteamLibrary\steamapps\common\RESIDENT EVIL requiem BIOHAZARD requiem"
+.\scripts\deploy.ps1 -GameDir "D:\SteamLibrary\steamapps\common\RESIDENT EVIL requiem BIOHAZARD requiem"
+```
+
 ## Usage
 
 1. Both players start RE9 and manually load the same area.
@@ -40,3 +56,14 @@ On this machine CMake selects `Visual Studio 17 2022`.
 3. Host sends the displayed join code to the client over Tailscale.
 4. Client pastes the join code and clicks `Join`.
 5. If BuildID, EXE version, or scene differ, the connection is denied and the overlay shows why.
+
+The host must allow inbound UDP `27777` in Windows Firewall. With Tailscale, no router port forwarding is expected.
+
+## Local install check
+
+After deployment, these files should exist in the RE9 folder:
+
+- `dinput8.dll`
+- `reframework/plugins/re9mp.dll`
+- `reframework/autorun/re9mp.lua`
+- `reframework_revision.txt` containing `a0e9010fb0449dc9d824b5978ee759eeaf50f7c6`
