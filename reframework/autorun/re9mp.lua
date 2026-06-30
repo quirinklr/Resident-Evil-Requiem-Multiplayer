@@ -17,6 +17,7 @@ local cfg = {
     auto_spawn_puppet = true,
     draw_remote_marker = true,
     local_dummy = false,
+    prefab_path = "",
 }
 
 pcall(function()
@@ -48,6 +49,8 @@ local function safe_string(v)
     return tostring(v)
 end
 
+local unpack_args = table.unpack or unpack
+
 local state = {
     seq = 0,
     last_sample_time = 0,
@@ -75,6 +78,9 @@ local state = {
     component_summary = "",
     method_signatures = "",
     player_fields = "",
+    prefab_hints = "",
+    prefab_hint_paths = {},
+    prefab_hint_objects = {},
     last_diagnostic_dump = 0,
     draw_status = "not drawn yet",
 }
@@ -478,13 +484,14 @@ local function method_signature(method)
         local ret = method:get_return_type()
         local ret_name = ret and ret:get_full_name() or "?"
         table.insert(parts, ret_name .. " " .. method:get_name() .. "(")
-        local params = method:get_params()
         local ptxt = {}
-        if params then
-            for _, p in ipairs(params) do
-                local ptype = p.t and p.t:get_full_name() or "?"
-                local pname = p.name or "arg"
-                table.insert(ptxt, ptype .. " " .. pname)
+        local param_types = method:get_param_types()
+        local param_names = method:get_param_names()
+        if param_types then
+            for i, ptype in ipairs(param_types) do
+                local type_name = ptype and ptype:get_full_name() or "?"
+                local pname = (param_names and param_names[i]) or ("arg" .. tostring(i))
+                table.insert(ptxt, type_name .. " " .. pname)
             end
         end
         table.insert(parts, table.concat(ptxt, ", "))
@@ -588,6 +595,147 @@ local function collect_component_summary(go)
     state.component_summary = table.concat(names, ", ")
 end
 
+local function add_unique(list, value, limit)
+    if not value or value == "" then return false end
+    value = tostring(value)
+    for _, existing in ipairs(list) do
+        if existing == value then return false end
+    end
+    if #list < (limit or 40) then
+        table.insert(list, value)
+        return true
+    end
+    return false
+end
+
+local function normalize_prefab_path(text)
+    if not text or text == "" then return nil end
+    text = tostring(text):gsub("\\", "/")
+    local bracket = text:match("%[@?([^%]]+%.pfb)%]")
+    local direct = text:match("([%w%p%s_%-/]+%.pfb)")
+    local path = bracket or direct
+    if not path then return nil end
+    path = path:gsub("^%s+", ""):gsub("%s+$", "")
+    path = path:gsub("^natives/%w%w%w/", "")
+    return path
+end
+
+local function path_from_managed_value(value)
+    if value == nil then return nil end
+    if type(value) == "string" then
+        return normalize_prefab_path(value)
+    end
+    if type(value) ~= "userdata" and type(value) ~= "table" then return nil end
+
+    local text = nil
+    for _, method in ipairs({"get_Path", "ToString", "get_Name"}) do
+        pcall(function()
+            if not text and value.call then
+                local result = value:call(method)
+                if result then text = tostring(result) end
+            end
+        end)
+        local path = normalize_prefab_path(text)
+        if path then return path end
+    end
+    return nil
+end
+
+local function is_prefab_object(value)
+    if not value or (type(value) ~= "userdata" and type(value) ~= "table") then return false end
+    local ok, result = pcall(function()
+        if not value.get_type_definition then return false end
+        local td = value:get_type_definition()
+        if not td then return false end
+        local name = td:get_full_name()
+        if name == "via.Prefab" then return true end
+        local prefab_td = sdk.find_type_definition("via.Prefab")
+        return prefab_td and td:is_a(prefab_td)
+    end)
+    return ok and result
+end
+
+local function collect_prefab_hints_from_object(label, obj, lines, paths, objects)
+    if not obj or not obj.get_type_definition then return end
+
+    pcall(function()
+        local td = obj:get_type_definition()
+        if not td then return end
+        for _, field in ipairs(td:get_fields()) do
+            local fname = field:get_name() or ""
+            local ftype = field:get_type()
+            local tname = ftype and ftype:get_full_name() or ""
+            local interesting = fname:find("Prefab") or fname:find("prefab")
+                or fname:find("Pfb") or fname:find("pfb")
+                or fname:find("Resource") or fname:find("resource")
+                or tname:find("Prefab") or tname:find("Resource")
+            if interesting then
+                local value = nil
+                pcall(function() value = obj:get_field(fname) end)
+                local path = path_from_managed_value(value)
+                if path then
+                    add_unique(paths, path, 24)
+                    add_unique(lines, label .. "." .. fname .. " -> " .. path, 24)
+                end
+                if is_prefab_object(value) then
+                    table.insert(objects, { label = label .. "." .. fname, prefab = value })
+                end
+            end
+        end
+    end)
+
+    pcall(function()
+        local td = obj:get_type_definition()
+        if not td then return end
+        for _, method in ipairs(td:get_methods()) do
+            local name = method:get_name() or ""
+            local ret = method:get_return_type()
+            local ret_name = ret and ret:get_full_name() or ""
+            local interesting = name:find("get_") == 1
+                and (name:find("Prefab") or name:find("prefab") or name:find("Resource") or ret_name:find("Prefab"))
+                and method:get_num_params() == 0
+            if interesting then
+                local value = nil
+                pcall(function() value = obj:call(name) end)
+                local path = path_from_managed_value(value)
+                if path then
+                    add_unique(paths, path, 24)
+                    add_unique(lines, label .. ":" .. name .. "() -> " .. path, 24)
+                end
+                if is_prefab_object(value) then
+                    table.insert(objects, { label = label .. ":" .. name .. "()", prefab = value })
+                end
+            end
+        end
+    end)
+end
+
+local function collect_prefab_hints(refs)
+    local lines, paths, objects = {}, {}, {}
+    if refs and refs.valid then
+        collect_prefab_hints_from_object("PlayerContext", refs.player, lines, paths, objects)
+        collect_prefab_hints_from_object("PlayerGO", refs.go, lines, paths, objects)
+        pcall(function()
+            local components = refs.go:call("get_Components")
+            if not components then return end
+            local count = components:call("get_Count") or 0
+            for i = 0, math.min(count - 1, 90) do
+                pcall(function()
+                    local comp = components:call("get_Item", i)
+                    if not comp then return end
+                    local td = comp:get_type_definition()
+                    local label = td and td:get_full_name() or ("Component" .. tostring(i))
+                    collect_prefab_hints_from_object(label, comp, lines, paths, objects)
+                end)
+            end
+        end)
+    end
+
+    state.prefab_hint_paths = paths
+    state.prefab_hint_objects = objects
+    state.prefab_hints = table.concat(lines, "\n")
+end
+
 local function dump_runtime_diagnostics()
     if now() < state.last_diagnostic_dump + 2.0 then return end
     state.last_diagnostic_dump = now()
@@ -598,6 +746,7 @@ local function dump_runtime_diagnostics()
         collect_component_summary(refs.go)
         collect_player_fields(refs.player)
     end
+    collect_prefab_hints(refs)
     collect_scene_candidates()
     collect_method_signatures()
 
@@ -612,6 +761,8 @@ local function dump_runtime_diagnostics()
             component_summary = state.component_summary,
             method_signatures = state.method_signatures,
             player_fields = state.player_fields,
+            prefab_hints = state.prefab_hints,
+            prefab_hint_paths = state.prefab_hint_paths,
         })
     end)
 end
@@ -647,6 +798,222 @@ local function is_valid_managed(obj)
     return ok and result
 end
 
+local function get_current_via_scene()
+    local scene = nil
+    pcall(function()
+        local sm = sdk.get_native_singleton("via.SceneManager")
+        local td = sdk.find_type_definition("via.SceneManager")
+        if sm and td then
+            scene = sdk.call_native_func(sm, td, "get_CurrentScene()")
+                or sdk.call_native_func(sm, td, "get_CurrentScene")
+        end
+    end)
+    return scene
+end
+
+local function make_vec3(x, y, z)
+    if Vector3f then
+        return Vector3f.new(x or 0, y or 0, z or 0)
+    end
+    local td = sdk.find_type_definition("via.vec3")
+    if not td then return nil end
+    local value = ValueType.new(td)
+    value.x = x or 0
+    value.y = y or 0
+    value.z = z or 0
+    return value
+end
+
+local function make_quat(qx, qy, qz, qw)
+    local td = sdk.find_type_definition("via.Quaternion") or sdk.find_type_definition("via.Quaternionf")
+    if not td then return nil end
+    local value = ValueType.new(td)
+    value.x = qx or 0
+    value.y = qy or 0
+    value.z = qz or 0
+    value.w = qw or 1
+    return value
+end
+
+local function get_spawn_pose(refs)
+    local pose = current_remote_pose()
+    if pose and pose.valid then
+        return pose
+    end
+
+    local snap = state.local_snapshot
+    if not snap or not snap.valid then
+        snap = make_local_snapshot()
+    end
+    local fx, fz = yaw_forward_from_snapshot(snap)
+    return {
+        valid = true,
+        px = (snap.px or 0) + (fx * 2.2),
+        py = snap.py or 0,
+        pz = (snap.pz or 0) + (fz * 2.2),
+        qx = snap.qx or 0,
+        qy = snap.qy or 0,
+        qz = snap.qz or 0,
+        qw = snap.qw or 1,
+    }
+end
+
+local function get_spawn_folder(refs)
+    local folder = nil
+    if refs and refs.go then
+        pcall(function() folder = refs.go:call("get_Folder") end)
+    end
+    if folder then return folder end
+
+    local scene = get_current_via_scene()
+    if scene then
+        pcall(function()
+            folder = scene:call("findFolder", "ModdedTemporaryObjects")
+                or scene:call("findFolder(System.String)", "ModdedTemporaryObjects")
+        end)
+    end
+    return folder
+end
+
+local function first_scene_transform()
+    local xform = nil
+    pcall(function()
+        local scene = get_current_via_scene()
+        if not scene then return end
+        local transforms = scene:call("findComponents(System.Type)", sdk.typeof("via.Transform"))
+        if transforms then xform = transforms[0] end
+    end)
+    return xform
+end
+
+local function adopt_puppet_from_result(result, label)
+    local go, xform = nil, nil
+    if result and is_valid_managed(result) then
+        pcall(function() xform = result:call("get_Transform") end)
+        if not xform then
+            pcall(function()
+                local td = result:get_type_definition()
+                if td and td:get_full_name() == "via.Transform" then
+                    xform = result
+                    go = result:call("get_GameObject")
+                end
+            end)
+        end
+        if xform and not go then
+            pcall(function() go = xform:call("get_GameObject") end)
+        end
+    end
+
+    if not xform or not is_valid_managed(xform) then
+        return false
+    end
+
+    pcall(function() if go then go = go:add_ref() end end)
+    pcall(function() xform = xform:add_ref() end)
+    pcall(function() if go then go:call("set_Name", "RE9MP Remote Grace") end end)
+    pcall(function() if go then go:call("set_Draw", true) end end)
+    pcall(function() if go then go:call("set_UpdateSelf", true) end end)
+    if go then disable_puppet_components(go) end
+
+    state.puppet_go = go
+    state.puppet_xform = xform
+    state.puppet_status = "spawned via " .. label
+    return true
+end
+
+local function create_prefab_from_path(path)
+    path = normalize_prefab_path(path) or path
+    if not path or path == "" then return nil, "empty prefab path" end
+    path = tostring(path):gsub("\\", "/"):lower()
+
+    local prefab = nil
+    local ok, err = pcall(function()
+        prefab = sdk.create_resource("via.Prefab", path)
+    end)
+    if not ok then return nil, safe_string(err) end
+    if prefab and prefab.add_ref then
+        pcall(function() prefab = prefab:add_ref() end)
+    end
+    if not prefab then return nil, "sdk.create_resource returned nil for " .. path end
+    return prefab, path
+end
+
+local function try_spawn_prefab_object(prefab, label, refs)
+    if not prefab then return false, "no prefab object" end
+    local pose = get_spawn_pose(refs)
+    local pos = make_vec3(pose.px or 0, pose.py or 0, pose.pz or 0)
+    local rot = make_quat(pose.qx or 0, pose.qy or 0, pose.qz or 0, pose.qw or 1)
+    local folder = get_spawn_folder(refs)
+    local before = first_scene_transform()
+
+    pcall(function() prefab:call("set_Standby", true) end)
+    local calls = {
+        { name = "instantiate(via.vec3, via.Quaternion, via.Folder)", args = { pos, rot, folder or 0 } },
+        { name = "instantiate(via.vec3, via.Folder)", args = { pos, folder or 0 } },
+        { name = "instantiate(via.vec3, via.Quaternion)", args = { pos, rot } },
+        { name = "instantiate(via.vec3)", args = { pos } },
+    }
+
+    local errors = {}
+    for _, call in ipairs(calls) do
+        if pos then
+            local result = nil
+            local ok, err = pcall(function()
+                result = prefab:call(call.name, unpack_args(call.args))
+            end)
+            if ok and result and adopt_puppet_from_result(result, label .. ":" .. call.name) then
+                return true
+            end
+            if not ok then table.insert(errors, call.name .. " -> " .. safe_string(err)) end
+        end
+    end
+
+    local after = first_scene_transform()
+    if after and after ~= before and adopt_puppet_from_result(after, label .. ":scene delta") then
+        return true
+    end
+
+    return false, (#errors > 0 and errors[1] or "prefab instantiate returned no GameObject")
+end
+
+local function try_spawn_prefab_candidate(refs)
+    collect_prefab_hints(refs)
+    local errors = {}
+
+    if cfg.prefab_path and cfg.prefab_path ~= "" then
+        local prefab, created_or_err = create_prefab_from_path(cfg.prefab_path)
+        if prefab then
+            local ok, err = try_spawn_prefab_object(prefab, "manual " .. created_or_err, refs)
+            if ok then return true end
+            table.insert(errors, "manual: " .. safe_string(err))
+        else
+            table.insert(errors, "manual create: " .. safe_string(created_or_err))
+        end
+    end
+
+    for _, candidate in ipairs(state.prefab_hint_objects or {}) do
+        local ok, err = try_spawn_prefab_object(candidate.prefab, candidate.label, refs)
+        if ok then return true end
+        table.insert(errors, candidate.label .. ": " .. safe_string(err))
+    end
+
+    for _, path in ipairs(state.prefab_hint_paths or {}) do
+        local prefab, created_or_err = create_prefab_from_path(path)
+        if prefab then
+            local ok, err = try_spawn_prefab_object(prefab, path, refs)
+            if ok then return true end
+            table.insert(errors, path .. ": " .. safe_string(err))
+        else
+            table.insert(errors, path .. ": " .. safe_string(created_or_err))
+        end
+    end
+
+    if #errors == 0 then
+        return false, "no via.Prefab/path hints found on Grace yet"
+    end
+    return false, errors[1]
+end
+
 local function try_spawn_puppet()
     state.puppet_last_attempt = now()
     local refs = get_local_player_refs()
@@ -654,6 +1021,9 @@ local function try_spawn_puppet()
         state.puppet_status = "no local player to clone"
         return false
     end
+
+    local prefab_ok, prefab_err = try_spawn_prefab_candidate(refs)
+    if prefab_ok then return true end
 
     collect_clone_candidates(refs.go)
 
@@ -673,7 +1043,7 @@ local function try_spawn_puppet()
     end
 
     if not clone then
-        state.puppet_status = "clone method not found yet"
+        state.puppet_status = "prefab failed: " .. safe_string(prefab_err) .. " | clone method not found yet"
         return false
     end
 
@@ -950,6 +1320,22 @@ local function draw_main_window()
     end
     imgui.text("Draw: " .. safe_string(state.draw_status))
     imgui.text("Puppet: " .. safe_string(state.puppet_status))
+    local prefab_changed, prefab_value = imgui.input_text("Grace prefab path##re9mp_prefab", cfg.prefab_path or "")
+    if prefab_changed then
+        cfg.prefab_path = prefab_value
+        save_cfg()
+    end
+    if state.prefab_hints ~= "" then
+        imgui.text("Prefab hints dumped to runtime_diagnostics.json")
+        local shown = 0
+        for line in tostring(state.prefab_hints):gmatch("[^\n]+") do
+            if shown >= 3 then break end
+            imgui.text(line)
+            shown = shown + 1
+        end
+    else
+        imgui.text_colored("Prefab hints: none found yet", 0xFF8888FF)
+    end
     if state.clone_candidates ~= "" then
         imgui.text("Clone candidates: " .. state.clone_candidates)
     end
@@ -959,7 +1345,7 @@ local function draw_main_window()
     if state.method_signatures ~= "" then
         imgui.text("Method signatures dumped to runtime_diagnostics.json")
     end
-    if imgui.button("Probe Grace Spawn") then try_spawn_puppet() end
+    if imgui.button("Probe Grace Prefab/Clone") then try_spawn_puppet() end
     imgui.same_line()
     if imgui.button("Despawn Puppet") then despawn_puppet() end
 
