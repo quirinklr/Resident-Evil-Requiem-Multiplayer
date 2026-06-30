@@ -15,6 +15,7 @@ local cfg = {
     join_code = "",
     command_id = 0,
     auto_spawn_puppet = true,
+    draw_remote_marker = true,
 }
 
 pcall(function()
@@ -60,6 +61,9 @@ local state = {
     puppet_status = "not spawned",
     puppet_last_attempt = 0,
     clone_candidates = "",
+    scene_candidates = "",
+    component_summary = "",
+    last_diagnostic_dump = 0,
 }
 
 local function get_current_scene()
@@ -336,6 +340,94 @@ local function collect_clone_candidates(go)
     state.clone_candidates = table.concat(names, ", ")
 end
 
+local function collect_methods_from_type(type_name, patterns, limit)
+    local names = {}
+    pcall(function()
+        local td = sdk.find_type_definition(type_name)
+        if not td then return end
+        for _, method in ipairs(td:get_methods()) do
+            local name = method:get_name()
+            if name then
+                for _, pattern in ipairs(patterns) do
+                    if name:find(pattern) then
+                        table.insert(names, name)
+                        break
+                    end
+                end
+            end
+            if #names >= limit then break end
+        end
+    end)
+    return names
+end
+
+local function collect_scene_candidates()
+    local patterns = {
+        "create", "Create", "spawn", "Spawn", "instantiate", "Instantiate",
+        "GameObject", "Prefab", "Resource", "add", "Add",
+    }
+    local names = {}
+
+    local function append(label, list)
+        if #list == 0 then return end
+        table.insert(names, label .. ": " .. table.concat(list, ", "))
+    end
+
+    append("via.SceneManager", collect_methods_from_type("via.SceneManager", patterns, 30))
+    append("via.Scene", collect_methods_from_type("via.Scene", patterns, 30))
+    append("via.GameObject", collect_methods_from_type("via.GameObject", patterns, 40))
+    append("app.CharacterManager", collect_methods_from_type("app.CharacterManager", patterns, 40))
+
+    state.scene_candidates = table.concat(names, " | ")
+end
+
+local function collect_component_summary(go)
+    local counts = {}
+    local names = {}
+    pcall(function()
+        local components = go:call("get_Components")
+        if not components then return end
+        local count = components:call("get_Count") or 0
+        for i = 0, math.min(count - 1, 80) do
+            pcall(function()
+                local comp = components:call("get_Item", i)
+                if not comp then return end
+                local td = comp:get_type_definition()
+                local tname = td and td:get_full_name() or "unknown"
+                if not counts[tname] then
+                    counts[tname] = true
+                    table.insert(names, tname)
+                end
+            end)
+        end
+    end)
+    state.component_summary = table.concat(names, ", ")
+end
+
+local function dump_runtime_diagnostics()
+    if now() < state.last_diagnostic_dump + 2.0 then return end
+    state.last_diagnostic_dump = now()
+
+    local refs = get_local_player_refs()
+    if refs.valid and refs.go then
+        collect_clone_candidates(refs.go)
+        collect_component_summary(refs.go)
+    end
+    collect_scene_candidates()
+
+    pcall(function()
+        json.dump_file(DATA_PREFIX .. "runtime_diagnostics.json", {
+            time_ms = now_ms(),
+            scene = get_current_scene(),
+            player_valid = refs.valid,
+            player_name = refs.name or "",
+            clone_candidates = state.clone_candidates,
+            scene_candidates = state.scene_candidates,
+            component_summary = state.component_summary,
+        })
+    end)
+end
+
 local function disable_puppet_components(go)
     pcall(function()
         local components = go:call("get_Components")
@@ -460,6 +552,21 @@ local function apply_remote_pose()
     end)
 end
 
+local function draw_remote_marker()
+    if not cfg.draw_remote_marker then return end
+    local pose = current_remote_pose()
+    if not pose or not pose.valid then return end
+
+    pcall(function()
+        local feet = Vector3f.new(pose.px or 0, (pose.py or 0) + 0.05, pose.pz or 0)
+        local chest = Vector3f.new(pose.px or 0, (pose.py or 0) + 1.05, pose.pz or 0)
+        local head = Vector3f.new(pose.px or 0, (pose.py or 0) + 1.65, pose.pz or 0)
+        draw.capsule(feet, head, 0.24, 0xFF00CCFF, false)
+        draw.sphere(head, 0.18, 0xFF00FFFF, true)
+        draw.world_text("RE9MP remote", chest, 0xFF00FFFF)
+    end)
+end
+
 local function draw_main_window()
     if not cfg.window_open or not imgui.begin_window then return end
     local visible = imgui.begin_window("RE9 Multiplayer MVP##re9mp", true, 0)
@@ -531,9 +638,17 @@ local function draw_main_window()
         cfg.auto_spawn_puppet = auto_val
         save_cfg()
     end
+    local marker_changed, marker_val = imgui.checkbox("Draw remote marker", cfg.draw_remote_marker)
+    if marker_changed then
+        cfg.draw_remote_marker = marker_val
+        save_cfg()
+    end
     imgui.text("Puppet: " .. safe_string(state.puppet_status))
     if state.clone_candidates ~= "" then
         imgui.text("Clone candidates: " .. state.clone_candidates)
+    end
+    if state.scene_candidates ~= "" then
+        imgui.text("Scene candidates: " .. state.scene_candidates)
     end
     if imgui.button("Spawn Puppet Probe") then try_spawn_puppet() end
     imgui.same_line()
@@ -556,7 +671,11 @@ re.on_frame(function()
         read_remote_snapshot()
         state.remote_read_time = t
     end
+    if state.status and state.status.connected then
+        dump_runtime_diagnostics()
+    end
     apply_remote_pose()
+    draw_remote_marker()
 end)
 
 re.on_draw_ui(function()

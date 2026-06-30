@@ -867,6 +867,9 @@ void recv_packets(NetState& st) {
             reinterpret_cast<sockaddr*>(&from), &from_len);
         if (received == SOCKET_ERROR) {
             const auto err = WSAGetLastError();
+            if (err == WSAEINVAL && st.connected) {
+                return;
+            }
             if (err != WSAEWOULDBLOCK) {
                 st.last_error = "recvfrom failed: " + std::to_string(err);
             }
