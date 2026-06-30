@@ -16,6 +16,7 @@ local cfg = {
     command_id = 0,
     auto_spawn_puppet = true,
     draw_remote_marker = true,
+    local_dummy = false,
 }
 
 pcall(function()
@@ -58,6 +59,8 @@ local state = {
     remote_seq_changed_at = 0,
     remote_samples = {},
     remote_read_time = 0,
+    dummy_seq = 0,
+    dummy_last_time = 0,
     puppet_go = nil,
     puppet_xform = nil,
     puppet_status = "not spawned",
@@ -68,6 +71,7 @@ local state = {
     method_signatures = "",
     player_fields = "",
     last_diagnostic_dump = 0,
+    draw_status = "not drawn yet",
 }
 
 local function get_current_scene()
@@ -271,6 +275,41 @@ local function read_remote_snapshot()
         t = now(),
         data = data,
     })
+    while #state.remote_samples > 12 do
+        table.remove(state.remote_samples, 1)
+    end
+end
+
+local function update_local_dummy()
+    if not cfg.local_dummy then return end
+    local snap = state.local_snapshot
+    if not snap or not snap.valid then return end
+    local t = now()
+    if t < state.dummy_last_time + 0.033 then return end
+    state.dummy_last_time = t
+    state.dummy_seq = state.dummy_seq + 1
+
+    local orbit = t * 1.3
+    local radius = 2.5
+    local dummy = {
+        valid = true,
+        seq = state.dummy_seq,
+        scene = snap.scene,
+        px = (snap.px or 0) + math.cos(orbit) * radius,
+        py = snap.py or 0,
+        pz = (snap.pz or 0) + math.sin(orbit) * radius,
+        qx = 0,
+        qy = snap.qy or 0,
+        qz = 0,
+        qw = snap.qw or 1,
+        vx = -math.sin(orbit) * radius * 1.3,
+        vy = 0,
+        vz = math.cos(orbit) * radius * 1.3,
+        flags = 1,
+        motion = "dummy",
+        stance = "dummy",
+    }
+    table.insert(state.remote_samples, { t = t, data = dummy })
     while #state.remote_samples > 12 do
         table.remove(state.remote_samples, 1)
     end
@@ -671,18 +710,37 @@ local function apply_remote_pose()
 end
 
 local function draw_remote_marker()
-    if not cfg.draw_remote_marker then return end
+    if not cfg.draw_remote_marker then
+        state.draw_status = "disabled"
+        return
+    end
     local pose = current_remote_pose()
-    if not pose or not pose.valid then return end
+    if not pose or not pose.valid then
+        state.draw_status = "no remote pose"
+        return
+    end
 
-    pcall(function()
+    local ok, err = pcall(function()
+        if not draw then error("draw global missing") end
         local feet = Vector3f.new(pose.px or 0, (pose.py or 0) + 0.05, pose.pz or 0)
         local chest = Vector3f.new(pose.px or 0, (pose.py or 0) + 1.05, pose.pz or 0)
         local head = Vector3f.new(pose.px or 0, (pose.py or 0) + 1.65, pose.pz or 0)
-        draw.capsule(feet, head, 0.24, 0xFF00CCFF, false)
-        draw.sphere(head, 0.18, 0xFF00FFFF, true)
-        draw.world_text("RE9MP remote", chest, 0xFF00FFFF)
+        if draw.capsule then draw.capsule(feet, head, 0.24, 0xFF00CCFF, false) end
+        if draw.sphere then draw.sphere(head, 0.18, 0xFF00FFFF, true) end
+        if draw.world_text then draw.world_text("RE9MP remote", chest, 0xFF00FFFF) end
+        local screen = nil
+        if draw.world_to_screen then screen = draw.world_to_screen(chest) end
+        if screen then
+            if draw.filled_circle then draw.filled_circle(screen.x, screen.y, 7, 0xFF00FFFF, 24) end
+            if draw.text then draw.text("RE9MP remote", screen.x + 10, screen.y - 8, 0xFF00FFFF) end
+            state.draw_status = string.format("draw ok: screen %.0f %.0f", screen.x or 0, screen.y or 0)
+        else
+            state.draw_status = "draw ok: remote world point not on screen"
+        end
     end)
+    if not ok then
+        state.draw_status = "draw failed: " .. safe_string(err)
+    end
 end
 
 local function draw_main_window()
@@ -772,6 +830,14 @@ local function draw_main_window()
         cfg.draw_remote_marker = marker_val
         save_cfg()
     end
+    local dummy_changed, dummy_val = imgui.checkbox("Local dummy remote", cfg.local_dummy)
+    if dummy_changed then
+        cfg.local_dummy = dummy_val
+        state.remote_samples = {}
+        state.remote_last_seq = nil
+        save_cfg()
+    end
+    imgui.text("Draw: " .. safe_string(state.draw_status))
     imgui.text("Puppet: " .. safe_string(state.puppet_status))
     if state.clone_candidates ~= "" then
         imgui.text("Clone candidates: " .. state.clone_candidates)
@@ -803,11 +869,11 @@ re.on_frame(function()
         read_remote_snapshot()
         state.remote_read_time = t
     end
-    if state.status and state.status.connected then
+    update_local_dummy()
+    if state.local_ok then
         dump_runtime_diagnostics()
     end
     apply_remote_pose()
-    draw_remote_marker()
 end)
 
 re.on_draw_ui(function()
@@ -818,6 +884,7 @@ re.on_draw_ui(function()
         imgui.tree_pop()
     end
     draw_main_window()
+    draw_remote_marker()
 end)
 
 log.info("[RE9MP] Lua bridge loaded")

@@ -208,6 +208,22 @@ If RE9 is installed somewhere else, pass the install path to both scripts:
 - Overlay shows BuildID or EXE mismatch: both players must update RE9 to the same Steam build.
 - Overlay opens but no remote Grace appears: send the host's and client's `Puppet:` and `Clone candidates:` lines from the overlay. The network path is separate from the RE9 runtime clone/spawn probe.
 
+### Offline remote marker test
+
+This test works without a second PC and checks whether the Lua overlay can draw a remote-player marker in the loaded RE9 scene.
+
+1. Start RE9 and load into gameplay until the overlay shows `Local player: detected`.
+2. Open `RE9 Multiplayer MVP`.
+3. Enable `Draw remote marker`.
+4. Enable `Local dummy remote`.
+5. Watch the `Remote:` line. It should update with a changing sequence number and distance.
+6. Watch the `Draw:` line:
+   - `draw ok: screen ...` means REFramework accepted the marker draw call and the marker should be on screen.
+   - `draw ok: remote world point not on screen` means the dummy exists but is behind/outside the camera view.
+   - `draw failed: ...` means the exact REFramework draw API error should be copied into the issue/debug log.
+
+`Local dummy remote` only creates synthetic remote snapshots around the local player. It does not test networking and it does not spawn the real Grace puppet.
+
 ## Local install check
 
 After deployment, these files should exist in the RE9 folder:
