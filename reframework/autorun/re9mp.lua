@@ -1190,9 +1190,6 @@ local function try_character_manager_spawn(refs)
     local char_mgr = sdk.get_managed_singleton("app.CharacterManager")
     if not char_mgr then return false, "CharacterManager not found" end
 
-    collect_character_spawn_diagnostics(refs)
-
-    local before = first_scene_transform()
     local calls = {
         {
             name = "requestSpawn(app.ContextID, app.CharacterKindID, app.MontageID, System.Int32, System.Boolean, app.CharacterUsePurposeFlag)",
@@ -1218,11 +1215,8 @@ local function try_character_manager_spawn(refs)
         end)
         if ok then
             state.character_spawn_status = "requestSpawn accepted: " .. call.label
-            local after = first_scene_transform()
-            if after and after ~= before and adopt_puppet_from_result(after, "CharacterManager " .. call.label) then
-                return true
-            end
-            return false, state.character_spawn_status .. "; no new character transform detected yet"
+            state.puppet_status = "requestSpawn sent via CharacterManager; look for new Grace"
+            return true
         else
             table.insert(errors, call.label .. ": " .. safe_string(err))
         end
@@ -1230,6 +1224,20 @@ local function try_character_manager_spawn(refs)
 
     state.character_spawn_status = (#errors > 0 and errors[1]) or "requestSpawn had no callable overload"
     return false, state.character_spawn_status
+end
+
+local function try_character_manager_only()
+    state.puppet_last_attempt = now()
+    local refs = get_local_player_refs()
+    if not refs.valid then
+        state.puppet_status = "no local player for CharacterManager probe"
+        return false
+    end
+    local ok, err = try_character_manager_spawn(refs)
+    if not ok then
+        state.puppet_status = "CharacterManager probe failed: " .. safe_string(err)
+    end
+    return ok
 end
 
 local function try_spawn_puppet(manual)
@@ -1574,7 +1582,7 @@ local function draw_main_window()
     if imgui.button("Refresh Spawn Diagnostics") then
         dump_runtime_diagnostics()
     end
-    if imgui.button("Probe Grace Character Spawn") then try_spawn_puppet(true) end
+    if imgui.button("Probe CharacterManager Only") then try_character_manager_only() end
     imgui.same_line()
     if imgui.button("Despawn Puppet") then despawn_puppet() end
 
