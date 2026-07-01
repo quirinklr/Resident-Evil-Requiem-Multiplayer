@@ -1377,21 +1377,6 @@ local function collect_character_spawn_diagnostics(refs)
         return
     end
 
-    for _, id in ipairs({1, 0, 2, 13632}) do
-        local data = nil
-        local ok, err = pcall(function()
-            data = char_mgr:call("getSpawnDataRef(app.ContextID)", id)
-                or char_mgr:call("getSpawnDataRef", id)
-        end)
-        if ok and data then
-            for _, line in ipairs(object_field_summary("getSpawnDataRef(" .. tostring(id) .. ")", data, 36)) do
-                table.insert(lines, line)
-            end
-        elseif not ok then
-            table.insert(lines, "getSpawnDataRef(" .. tostring(id) .. ") failed: " .. safe_string(err))
-        end
-    end
-
     if refs and refs.player then
         for _, line in ipairs(object_field_summary("PlayerContext", refs.player, 40)) do
             table.insert(lines, line)
@@ -2425,7 +2410,7 @@ local function schedule_controller_restore(control, old_spawn_context, old_reque
         old_spawn_context = old_spawn_context,
         old_request_end = old_request_end,
         old_permitted = old_permitted,
-        restore_at = now() + 2.0,
+        restore_at = now() + 15.0,
     }
 end
 
@@ -2512,10 +2497,130 @@ local function run_controller_grace_spawn_probe()
     pcall(function() control:set_field("<HasPermittedSpawn>k__BackingField", true) end)
     schedule_controller_restore(control, old_spawn_context, old_request_end, old_permitted)
 
+    for _, call_name in ipairs({"registerSpawnGroup(app.ICharacterSpawnControl)", "registerSpawnGroup"}) do
+        local ok_group, err_group = pcall(function()
+            char_mgr:call(call_name, control)
+        end)
+        table.insert(lines, call_name .. "(controller control) -> " .. (ok_group and "ok" or ("ERR " .. safe_string(err_group))))
+        if ok_group then break end
+    end
+
+    local owner_context_id = nil
+    for _, call_name in ipairs({"getPlayerContextID(app.CharacterKindID)", "getPlayerContextID"}) do
+        local ok_owner, result = pcall(function()
+            return char_mgr:call(call_name, kind_grace)
+        end)
+        table.insert(lines, call_name .. "(owner cp_A100) -> " .. (ok_owner and safe_string(result) or ("ERR " .. safe_string(result))))
+        if ok_owner and result and not owner_context_id then
+            owner_context_id = result
+        end
+    end
+    if owner_context_id then
+        for _, args in ipairs({
+            { label = "new,owner", values = { ctx, owner_context_id } },
+            { label = "owner,new", values = { owner_context_id, ctx } },
+        }) do
+            local ok_owner_request, result_owner_request = pcall(function()
+                return char_mgr:call("getAndRequestSpawnOwner(app.ContextID, app.ContextID)", unpack_args(args.values))
+            end)
+            table.insert(lines, "getAndRequestSpawnOwner(" .. args.label .. ") -> " .. (ok_owner_request and safe_string(result_owner_request) or ("ERR " .. safe_string(result_owner_request))))
+            if ok_owner_request and result_owner_request then break end
+        end
+    end
+
+    for _, call_name in ipairs({"isUsedContext(app.ContextID)", "isUsedContext"}) do
+        local ok_used, result_used = pcall(function()
+            return char_mgr:call(call_name, ctx)
+        end)
+        table.insert(lines, call_name .. "(controller ctx after group/owner) -> " .. (ok_used and safe_string(result_used) or ("ERR " .. safe_string(result_used))))
+    end
+
+    local context_ref = nil
+    local factory = nil
+    for _, call_name in ipairs({"getCharacterContextFactory(app.CharacterKindID)", "getCharacterContextFactory"}) do
+        local ok_factory, result = pcall(function()
+            return char_mgr:call(call_name, kind_grace)
+        end)
+        table.insert(lines, call_name .. "(controller cp_A100) -> " .. (ok_factory and safe_string(result) or ("ERR " .. safe_string(result))))
+        if ok_factory and result and not factory then
+            factory = result
+        end
+    end
+    if factory then
+        for _, attempt in ipairs({
+            {
+                name = "readyContext(app.ContextID, app.CharacterKindID, System.Func`1<app.CharacterContext>, System.Boolean)",
+                args = { ctx, kind_grace, factory, false },
+            },
+            {
+                name = "readyContext(app.ContextID, app.CharacterKindID, System.Func`1<app.CharacterContext>)",
+                args = { ctx, kind_grace, factory },
+            },
+            {
+                name = "readyContext",
+                args = { ctx, kind_grace, factory },
+            },
+        }) do
+            local ok_ready, result = pcall(function()
+                return char_mgr:call(attempt.name, unpack_args(attempt.args))
+            end)
+            table.insert(lines, attempt.name .. "(controller ctx) -> " .. (ok_ready and safe_string(result) or ("ERR " .. safe_string(result))))
+            if ok_ready and result and not context_ref then
+                context_ref = result
+                pcall(function() context_ref = context_ref:add_ref() end)
+            end
+        end
+    end
+
+    if context_ref then
+        pcall(function()
+            local go_before = context_ref:call("get_GameObject")
+            table.insert(lines, "Controller context before create get_GameObject -> " .. safe_string(go_before))
+        end)
+        pcall(function()
+            local updater_before = context_ref:call("get_Updater")
+            table.insert(lines, "Controller context before create get_Updater -> " .. safe_string(updater_before))
+        end)
+    end
+
     for _, call in ipairs({
         { name = "setupControlCharacter(app.LevelPlayerCreateController.CreateSetting)", args = { setting } },
+        { name = "setupCommonMessageKind(app.LevelPlayerCreateController.CreateSetting, app.CharacterContext)", args = { setting, context_ref }, require_context = true },
+    }) do
+        if call.require_context and not context_ref then
+            table.insert(lines, "Controller:" .. call.name .. " -> skipped (no context)")
+            goto continue_controller_call
+        end
+        local ok_call, err_call = pcall(function()
+            control:call(call.name, unpack_args(call.args))
+        end)
+        table.insert(lines, "Controller:" .. call.name .. " -> " .. (ok_call and "ok" or ("ERR " .. safe_string(err_call))))
+        ::continue_controller_call::
+    end
+
+    local montage_invalid = get_static_field_value("app.MontageID", {"Invalid"})
+    local purpose_default = get_static_field_value("app.CharacterUsePurposeFlag", {"Default"}) or 0
+    if montage_invalid then
+        local ok_spawn, err_spawn = pcall(function()
+            char_mgr:call(
+                "requestSpawn(app.ContextID, app.CharacterKindID, app.MontageID, System.Int32, System.Boolean, app.CharacterUsePurposeFlag)",
+                ctx,
+                kind_grace,
+                montage_invalid,
+                0,
+                false,
+                purpose_default
+            )
+        end)
+        table.insert(lines, "CharacterManager:requestSpawn(controller ctx) -> " .. (ok_spawn and "ok" or ("ERR " .. safe_string(err_spawn))))
+    else
+        table.insert(lines, "CharacterManager:requestSpawn(controller ctx) -> skipped (MontageID.Invalid missing)")
+    end
+
+    for _, call in ipairs({
         { name = "app.ICharacterSpawnControl.requestSpawn()", args = {} },
         { name = "createControlCharacter()", args = {} },
+        { name = "app.ICharacterSpawnControl.requestResume(System.Int32)", args = { 0 } },
     }) do
         local ok_call, err_call = pcall(function()
             control:call(call.name, unpack_args(call.args))
@@ -2523,7 +2628,6 @@ local function run_controller_grace_spawn_probe()
         table.insert(lines, "Controller:" .. call.name .. " -> " .. (ok_call and "ok" or ("ERR " .. safe_string(err_call))))
     end
 
-    local context_ref = nil
     for _, call_name in ipairs({"getContextRef(app.ContextID)", "getContextRef"}) do
         local ok_ref, result = pcall(function()
             return char_mgr:call(call_name, ctx)
