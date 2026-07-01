@@ -9,6 +9,7 @@ local COMMAND_FILE = DATA_PREFIX .. "command.json"
 local DEV_COMMAND_FILE = DATA_PREFIX .. "dev_command.json"
 local DEV_RESULT_FILE = DATA_PREFIX .. "dev_result.json"
 local SPAWN_HOOK_FILE = DATA_PREFIX .. "spawn_hook_log.json"
+local LEVEL_TRACE_FILE = DATA_PREFIX .. "level_load_trace.json"
 local RESOURCE_PROBE_FILE = DATA_PREFIX .. "resource_probe.json"
 local LOCAL_FILE = DATA_PREFIX .. "local_snapshot.json"
 local STATUS_FILE = DATA_PREFIX .. "status.json"
@@ -23,6 +24,7 @@ local cfg = {
     local_dummy = false,
     prefab_path = "",
     auto_runtime_diagnostics = false,
+    level_trace_enabled = true,
 }
 
 pcall(function()
@@ -100,6 +102,13 @@ local state = {
     spawn_hook_status = "not installed",
     spawn_hook_events = {},
     spawn_hook_dirty = false,
+    level_trace_enabled = cfg.level_trace_enabled and true or false,
+    level_trace_status = "waiting",
+    level_trace_events = {},
+    level_trace_dirty = false,
+    level_trace_started_ms = 0,
+    level_trace_last_dump = 0,
+    level_trace_last_scene = "",
     resource_probe_status = "",
     character_object_probe = "",
     last_spawn_context = nil,
@@ -579,8 +588,105 @@ local function describe_hook_arg(arg)
             local text = obj:call("ToString")
             if text then out.text = safe_string(text) end
         end)
+        pcall(function()
+            local td = obj:get_type_definition()
+            local type_name = td and td:get_full_name() or ""
+            if not type_name:find("SpawnData") and not type_name:find("CharacterContext") and not type_name:find("PlayerContext") then
+                return
+            end
+
+            out.fields = {}
+            local n = 0
+            for _, field in ipairs(td:get_fields()) do
+                local name = field:get_name() or ""
+                local ftype = field:get_type()
+                local field_type = ftype and ftype:get_full_name() or ""
+                local interesting = name:find("Context") or name:find("Kind") or name:find("Spawn")
+                    or name:find("Montage") or name:find("Purpose") or name:find("GameObject")
+                    or name:find("Transform") or field_type:find("Context") or field_type:find("Kind")
+                if interesting then
+                    local value = nil
+                    pcall(function() value = obj:get_field(name) end)
+                    table.insert(out.fields, {
+                        name = name,
+                        type = field_type,
+                        value = safe_string(value),
+                    })
+                    n = n + 1
+                    if n >= 16 then break end
+                end
+            end
+        end)
     end)
     return out
+end
+
+local function reset_level_trace(reason)
+    state.level_trace_events = {}
+    state.level_trace_dirty = true
+    state.level_trace_started_ms = now_ms()
+    state.level_trace_last_scene = get_current_scene()
+    state.level_trace_status = "recording: " .. safe_string(reason or "manual")
+end
+
+local function push_level_trace_event(method_name, args, phase, retval)
+    if not state.level_trace_enabled then return end
+    local event = {
+        time_ms = now_ms(),
+        dt_ms = math.max(0, now_ms() - (state.level_trace_started_ms or 0)),
+        scene = get_current_scene(),
+        phase = phase or "pre",
+        method = method_name,
+        args = {},
+    }
+    if args then
+        for i = 1, 10 do
+            local arg = args[i]
+            if arg == nil then break end
+            event.args[i] = describe_hook_arg(arg)
+        end
+    end
+    if retval ~= nil then
+        event.retval = describe_hook_arg(retval)
+    end
+    table.insert(state.level_trace_events, event)
+    while #state.level_trace_events > 300 do
+        table.remove(state.level_trace_events, 1)
+    end
+    state.level_trace_dirty = true
+    state.level_trace_status = "recording events=" .. tostring(#state.level_trace_events)
+end
+
+local function push_level_trace_note(note)
+    if not state.level_trace_enabled then return end
+    table.insert(state.level_trace_events, {
+        time_ms = now_ms(),
+        dt_ms = math.max(0, now_ms() - (state.level_trace_started_ms or 0)),
+        scene = get_current_scene(),
+        phase = "note",
+        method = safe_string(note),
+        args = {},
+    })
+    while #state.level_trace_events > 300 do
+        table.remove(state.level_trace_events, 1)
+    end
+    state.level_trace_dirty = true
+    state.level_trace_status = "recording events=" .. tostring(#state.level_trace_events)
+end
+
+local function dump_level_trace(force)
+    if not force and not state.level_trace_dirty then return end
+    state.level_trace_dirty = false
+    pcall(function()
+        json.dump_file(LEVEL_TRACE_FILE, {
+            time_ms = now_ms(),
+            active = state.level_trace_enabled,
+            status = state.level_trace_status,
+            scene = get_current_scene(),
+            started_ms = state.level_trace_started_ms,
+            events = state.level_trace_events,
+        })
+    end)
 end
 
 local function push_spawn_hook_event(method_name, args)
@@ -627,21 +733,52 @@ local function install_spawn_observer_hooks()
         end
 
         local installed = 0
+        local observe = {
+            requestSpawn = true,
+            requestInstantiateMontage = true,
+            registerSpawnData = true,
+            unregisterSpawnData = true,
+            readyContext = true,
+            storeContext = true,
+            restoreContext = true,
+            unregisterContext = true,
+            clearContext = true,
+            registerSpawnGroup = true,
+            unregisterSpawnGroup = true,
+            registerPlayerContextIDList = true,
+            unregisterPlayerContextIDList = true,
+            getCharacterContextFactory = true,
+            notifyPlayerInitialized = true,
+            setPlayerInitializeNum = true,
+            notifyStartPlayerContinuousChapter = true,
+            notifyEndPlayerContinuousChapter = true,
+            onChangeActivePlayer = true,
+        }
         for _, method in ipairs(td:get_methods()) do
             local name = method:get_name()
-            if name == "requestSpawn" or name == "requestInstantiateMontage" then
+            if observe[name] then
                 local label = name
                 pcall(function() label = method_signature(method) end)
                 sdk.hook(method, function(args)
                     pcall(function() push_spawn_hook_event(label, args) end)
+                    pcall(function() push_level_trace_event(label, args, "pre", nil) end)
                 end, function(retval)
+                    pcall(function()
+                        if name == "readyContext" or name == "restoreContext" or name == "getCharacterContextFactory" then
+                            push_level_trace_event(label, nil, "post", retval)
+                        end
+                    end)
                     return retval
                 end)
                 installed = installed + 1
             end
         end
         state.spawn_hook_status = "installed " .. tostring(installed) .. " CharacterManager observer hooks"
+        if state.level_trace_enabled and state.level_trace_started_ms == 0 then
+            reset_level_trace("script load")
+        end
         dump_spawn_hook_log(true)
+        dump_level_trace(true)
     end)
 
     if not ok then
@@ -1740,8 +1877,8 @@ local function run_request_spawn_registered_duplicate()
         return false, state.character_spawn_status
     end
 
-    set_fields_by_type_or_name(duplicate, "app.ContextID", {"ContextID", "ContextId", "Context"}, ctx, "SpawnData.ContextID", lines)
-    set_fields_by_type_or_name(duplicate, "app.CharacterKindID", {"CharacterKindID", "CharacterKind", "KindID"}, kind_grace, "SpawnData.CharacterKindID", lines)
+    set_fields_by_type_or_name(duplicate, "app.ContextID", {}, ctx, "SpawnData.ContextID", lines)
+    set_fields_by_type_or_name(duplicate, "app.CharacterKindID", {}, kind_grace, "SpawnData.CharacterKindID", lines)
 
     local registered = false
     for _, call_name in ipairs({"registerSpawnData(app.CharacterSpawnData)", "registerSpawnData"}) do
@@ -2295,6 +2432,8 @@ local function write_dev_result(id, ok, message)
             draw = state.draw_status,
             spawn_hook_status = state.spawn_hook_status,
             spawn_hook_events = #state.spawn_hook_events,
+            level_trace_status = state.level_trace_status,
+            level_trace_events = #state.level_trace_events,
         })
     end)
 end
@@ -2335,6 +2474,23 @@ local function poll_dev_command()
     elseif action == "spawn_hook_status" then
         dump_spawn_hook_log(true)
         message = state.spawn_hook_status .. " events=" .. tostring(#state.spawn_hook_events)
+    elseif action == "start_level_trace" then
+        state.level_trace_enabled = true
+        cfg.level_trace_enabled = true
+        save_cfg()
+        reset_level_trace(cmd.text ~= "" and cmd.text or "dev command")
+        dump_level_trace(true)
+        message = state.level_trace_status
+    elseif action == "stop_level_trace" then
+        state.level_trace_enabled = false
+        cfg.level_trace_enabled = false
+        save_cfg()
+        state.level_trace_status = "stopped events=" .. tostring(#state.level_trace_events)
+        dump_level_trace(true)
+        message = state.level_trace_status
+    elseif action == "dump_level_trace" then
+        dump_level_trace(true)
+        message = state.level_trace_status .. " events=" .. tostring(#state.level_trace_events)
     elseif action == "diagnostics" then
         dump_runtime_diagnostics()
         message = "runtime diagnostics dumped"
@@ -2686,6 +2842,30 @@ local function draw_main_window()
         imgui.text("Dev: " .. safe_string(state.dev_status))
     end
     imgui.text("Spawn hook: " .. safe_string(state.spawn_hook_status))
+    imgui.text("Level trace: " .. safe_string(state.level_trace_status))
+    local trace_changed, trace_enabled = imgui.checkbox("Record level-load trace", state.level_trace_enabled)
+    if trace_changed then
+        state.level_trace_enabled = trace_enabled
+        cfg.level_trace_enabled = trace_enabled
+        save_cfg()
+        if trace_enabled then
+            reset_level_trace("ui")
+        else
+            state.level_trace_status = "stopped events=" .. tostring(#state.level_trace_events)
+        end
+        dump_level_trace(true)
+    end
+    if imgui.button("Reset Level Trace") then
+        state.level_trace_enabled = true
+        cfg.level_trace_enabled = true
+        save_cfg()
+        reset_level_trace("ui reset")
+        dump_level_trace(true)
+    end
+    imgui.same_line()
+    if imgui.button("Dump Level Trace") then
+        dump_level_trace(true)
+    end
     if imgui.button("Refresh Spawn Diagnostics") then
         dump_runtime_diagnostics()
     end
@@ -2698,6 +2878,13 @@ end
 re.on_frame(function()
     local t = now()
     install_spawn_observer_hooks()
+    if state.level_trace_enabled then
+        local scene = get_current_scene()
+        if scene ~= state.level_trace_last_scene then
+            state.level_trace_last_scene = scene
+            push_level_trace_note("scene=" .. safe_string(scene))
+        end
+    end
     if t >= state.last_snapshot_time + 0.033 then
         write_local_snapshot()
         state.last_snapshot_time = t
@@ -2721,6 +2908,10 @@ re.on_frame(function()
     if t >= state.last_spawn_hook_dump + 1.0 then
         dump_spawn_hook_log(false)
         state.last_spawn_hook_dump = t
+    end
+    if t >= state.level_trace_last_dump + 0.50 then
+        dump_level_trace(false)
+        state.level_trace_last_dump = t
     end
     apply_remote_pose()
 end)
