@@ -24,7 +24,8 @@ local cfg = {
     local_dummy = false,
     prefab_path = "",
     auto_runtime_diagnostics = false,
-    level_trace_enabled = true,
+    level_trace_enabled = false,
+    controller_trace_enabled = false,
 }
 
 pcall(function()
@@ -113,6 +114,7 @@ local state = {
     character_object_probe = "",
     last_spawn_context = nil,
     last_spawn_context_text = "",
+    pending_controller_restore = nil,
 }
 
 local function get_current_scene()
@@ -547,6 +549,14 @@ local function collect_method_signatures()
         {"app.PlayerSpawnData", {".ctor", "duplicate"}},
         {"app.CharacterContext", {"get_GameObject", "get_Transform", "get_ContextID", "get_CharacterKindID"}},
         {"app.PlayerContext", {"get_GameObject", "get_Transform", "get_ContextID", "get_CharacterKindID"}},
+        {"app.LevelPlayerCreateController", {
+            "setupControlCharacter", "setupCommonMessageKind", "createControlCharacter",
+            "suspendChapterInitControlCharacter", "destroyControlCharacter",
+            "app.ICharacterSpawnControl.requestSpawn", "app.ICharacterSpawnControl.requestResume",
+            "app.ICharacterSpawnControl.get_SpawnID", "app.ICharacterSpawnControl.get_ManagedContextID",
+            "app.ICharacterSpawnControl.getAllManagedContextID",
+        }},
+        {"app.LevelPlayerCreateController.CreateSetting", {".ctor"}},
         {"via.Prefab", {"instantiate"}},
         {"via.GameObject", {"create", "createComponent"}},
         {"via.Scene", {"findGameObject", "findGameObjects", "findGameObjectsWithTag"}},
@@ -591,7 +601,13 @@ local function describe_hook_arg(arg)
         pcall(function()
             local td = obj:get_type_definition()
             local type_name = td and td:get_full_name() or ""
-            if not type_name:find("SpawnData") and not type_name:find("CharacterContext") and not type_name:find("PlayerContext") then
+            if not type_name:find("SpawnData")
+                and not type_name:find("CharacterContext")
+                and not type_name:find("PlayerContext")
+                and not type_name:find("LevelPlayerCreateController")
+                and not type_name:find("CreateSetting")
+                and not type_name:find("ContextID")
+                and not type_name:find("CharacterKindID") then
                 return
             end
 
@@ -603,7 +619,13 @@ local function describe_hook_arg(arg)
                 local field_type = ftype and ftype:get_full_name() or ""
                 local interesting = name:find("Context") or name:find("Kind") or name:find("Spawn")
                     or name:find("Montage") or name:find("Purpose") or name:find("GameObject")
-                    or name:find("Transform") or field_type:find("Context") or field_type:find("Kind")
+                    or name:find("Transform") or name:find("Player") or name:find("Create")
+                    or name:find("Setting") or name:find("Default") or name:find("Init")
+                    or name:find("Enable") or name:find("Pose") or name:find("Position")
+                    or name:find("Rotation") or name:find("Chapter") or name:find("Message")
+                    or name:find("Prefab") or name:find("Resource") or name:find("Path")
+                    or field_type:find("Context") or field_type:find("Kind")
+                    or field_type:find("CreateSetting") or field_type:find("Spawn")
                 if interesting then
                     local value = nil
                     pcall(function() value = obj:get_field(name) end)
@@ -613,7 +635,7 @@ local function describe_hook_arg(arg)
                         value = safe_string(value),
                     })
                     n = n + 1
-                    if n >= 16 then break end
+                    if n >= 40 then break end
                 end
             end
         end)
@@ -651,7 +673,7 @@ local function push_level_trace_event(method_name, args, phase, retval, max_args
         event.retval = describe_hook_arg(retval)
     end
     table.insert(state.level_trace_events, event)
-    while #state.level_trace_events > 300 do
+    while #state.level_trace_events > 1200 do
         table.remove(state.level_trace_events, 1)
     end
     state.level_trace_dirty = true
@@ -668,7 +690,7 @@ local function push_level_trace_note(note)
         method = safe_string(note),
         args = {},
     })
-    while #state.level_trace_events > 300 do
+    while #state.level_trace_events > 1200 do
         table.remove(state.level_trace_events, 1)
     end
     state.level_trace_dirty = true
@@ -780,7 +802,41 @@ local function install_spawn_observer_hooks()
                 installed = installed + 1
             end
         end
-        state.spawn_hook_status = "installed " .. tostring(installed) .. " CharacterManager observer hooks"
+        local controller_td = cfg.controller_trace_enabled and sdk.find_type_definition("app.LevelPlayerCreateController") or nil
+        if controller_td then
+            for _, method in ipairs(controller_td:get_methods()) do
+                local name = method:get_name()
+                local observe_controller = name == "setupControlCharacter"
+                    or name == "setupCommonMessageKind"
+                    or name == "createControlCharacter"
+                    or name == "suspendChapterInitControlCharacter"
+                    or name == "destroyControlCharacter"
+                    or name:find("makeSpawnControlBackup", 1, true) ~= nil
+                if observe_controller then
+                    local label = "LevelPlayerCreateController." .. name
+                    local arg_limit = 2
+                    pcall(function() label = "LevelPlayerCreateController." .. method_signature(method) end)
+                    pcall(function()
+                        local param_types = method:get_param_types()
+                        arg_limit = (param_types and #param_types or 0) + 2
+                    end)
+                    sdk.hook(method, function(args)
+                        pcall(function() push_spawn_hook_event(label, args, arg_limit) end)
+                        pcall(function() push_level_trace_event(label, args, "pre", nil, arg_limit) end)
+                    end, function(retval)
+                        pcall(function()
+                            push_level_trace_event(label, nil, "post", retval, 0)
+                        end)
+                        return retval
+                    end)
+                    installed = installed + 1
+                end
+            end
+        elseif cfg.controller_trace_enabled then
+            push_level_trace_note("LevelPlayerCreateController type not found")
+        end
+
+        state.spawn_hook_status = "installed " .. tostring(installed) .. " observer hooks"
         if state.level_trace_enabled and state.level_trace_started_ms == 0 then
             reset_level_trace("script load")
         end
@@ -1396,6 +1452,9 @@ local function append_iterable_summary(lines, label, obj, limit)
 
     local count = nil
     pcall(function() count = obj:call("get_Count") end)
+    if count == nil then
+        pcall(function() count = obj:get_size() end)
+    end
     if count then table.insert(lines, label .. " count=" .. tostring(count)) end
 
     -- RE Engine dictionary get_Item expects a key, not a numeric index. Do not
@@ -1407,7 +1466,15 @@ local function append_iterable_summary(lines, label, obj, limit)
     if count then
         for i = 0, math.min((tonumber(count) or 0) - 1, (limit or 8) - 1) do
             pcall(function()
-                local item = obj:call("get_Item", i)
+                local item = nil
+                local ok_item = pcall(function()
+                    item = obj:call("get_Item", i)
+                end)
+                if not ok_item or item == nil then
+                    pcall(function()
+                        item = obj:get_element(i)
+                    end)
+                end
                 table.insert(lines, label .. "[" .. tostring(i) .. "]=" .. safe_string(item))
                 for _, line in ipairs(object_field_summary(label .. "[" .. tostring(i) .. "]", item, 18)) do
                     table.insert(lines, line)
@@ -1513,6 +1580,63 @@ local function append_player_context_deep_summary(lines, label, player_context)
     end
 end
 
+local function append_create_setting_summary(lines, label, setting)
+    table.insert(lines, label .. "=" .. safe_string(setting))
+    if not setting then return end
+
+    for _, line in ipairs(object_all_field_summary(label, setting, 120)) do
+        table.insert(lines, line)
+    end
+    for _, line in ipairs(object_method_summary(label, setting, {
+        "Context", "Kind", "Character", "Player", "Spawn", "Pose", "Position", "Rotation", "Chapter", "Create", "Default", "Enable",
+    }, 120)) do
+        table.insert(lines, line)
+    end
+end
+
+local function append_level_player_create_controller_summary(lines, label, control)
+    if not control then return end
+
+    append_safe_call_summary(lines, label, control, {
+        "app.ICharacterSpawnControl.get_SpawnID()",
+        "app.ICharacterSpawnControl.get_ManagedContextID()",
+        "get_HasPermittedSpawn",
+        "app.ICharacterSpawnControl.getAllManagedContextID()",
+    })
+
+    for _, field_name in ipairs({
+        "_SpawnContextID",
+        "_InitControlPlayer",
+        "_DefaultPlayer",
+        "_OtherInitPlayerArray",
+        "EnableOtherInitPlayerArray",
+    }) do
+        local value = nil
+        pcall(function() value = control:get_field(field_name) end)
+        local field_label = label .. "." .. field_name
+        if tostring(field_name):find("Array", 1, true) then
+            append_iterable_summary(lines, field_label, value, 8)
+            local count = nil
+            if value then
+                pcall(function() count = value:call("get_Count") end)
+                if count == nil then
+                    pcall(function() count = value:get_size() end)
+                end
+            end
+            for i = 0, math.min((tonumber(count) or 0) - 1, 7) do
+                local item = nil
+                local ok_item = pcall(function() item = value:call("get_Item", i) end)
+                if not ok_item or item == nil then
+                    pcall(function() item = value:get_element(i) end)
+                end
+                append_create_setting_summary(lines, field_label .. "[" .. tostring(i) .. "].deep", item)
+            end
+        else
+            append_create_setting_summary(lines, field_label, value)
+        end
+    end
+end
+
 local function append_spawn_data_deep_summary(lines, label, spawn_data)
     if not spawn_data then return end
     table.insert(lines, label .. " deep=" .. safe_string(spawn_data))
@@ -1543,6 +1667,9 @@ local function append_spawn_data_deep_summary(lines, label, spawn_data)
             "Context", "Kind", "Spawn", "Control", "Group", "Owner", "Request", "Execute", "Create", "Setup", "Initialize", "Update", "Enable",
         }, 120)) do
             table.insert(lines, line)
+        end
+        if field_name == "<SpawnControl>k__BackingField" then
+            append_level_player_create_controller_summary(lines, nested_label, value)
         end
     end
 end
@@ -2205,6 +2332,241 @@ local function run_ready_registered_duplicate()
     return context_ref ~= nil or ok_spawn, state.character_spawn_status
 end
 
+local function get_spawn_control_bundle(char_mgr, kind_grace, lines)
+    local player_context_id = nil
+    for _, call_name in ipairs({"getPlayerContextID(app.CharacterKindID)", "getPlayerContextID"}) do
+        local ok, result = pcall(function()
+            return char_mgr:call(call_name, kind_grace)
+        end)
+        table.insert(lines, "bundle " .. call_name .. "(cp_A100) -> " .. (ok and safe_string(result) or ("ERR " .. safe_string(result))))
+        if ok and result and not player_context_id then
+            player_context_id = result
+        end
+    end
+    if not player_context_id then return nil, nil, nil, "cp_A100 ContextID not found" end
+
+    local spawn_data = nil
+    for _, call_name in ipairs({"getSpawnDataRef(app.ContextID)", "getSpawnDataRef"}) do
+        local ok, result = pcall(function()
+            return char_mgr:call(call_name, player_context_id)
+        end)
+        table.insert(lines, "bundle " .. call_name .. "(cp_A100 ctx) -> " .. (ok and safe_string(result) or ("ERR " .. safe_string(result))))
+        if ok and result and not spawn_data then
+            spawn_data = result
+        end
+    end
+    if not spawn_data then return nil, nil, nil, "cp_A100 SpawnData not found" end
+
+    local control = nil
+    pcall(function() control = spawn_data:get_field("<SpawnControl>k__BackingField") end)
+    table.insert(lines, "bundle SpawnControl -> " .. safe_string(control))
+    if not control then return nil, nil, nil, "SpawnControl not found" end
+
+    local setting = nil
+    pcall(function() setting = control:get_field("_DefaultPlayer") end)
+    if not setting then pcall(function() setting = control:get_field("_InitControlPlayer") end) end
+    table.insert(lines, "bundle CreateSetting -> " .. safe_string(setting))
+    if not setting then return nil, nil, nil, "Default CreateSetting not found" end
+
+    return spawn_data, control, setting, ""
+end
+
+local function make_controller_create_setting(default_setting, kind, lines)
+    local ok_new, setting = pcall(function()
+        return sdk.create_instance("app.LevelPlayerCreateController.CreateSetting")
+    end)
+    table.insert(lines, "sdk.create_instance(CreateSetting) -> " .. (ok_new and safe_string(setting) or ("ERR " .. safe_string(setting))))
+    if not ok_new or not setting then
+        table.insert(lines, "using default CreateSetting directly")
+        return default_setting
+    end
+
+    pcall(function() setting = setting:add_ref() end)
+    for _, ctor in ipairs({".ctor()", ".ctor"}) do
+        local ok_ctor, err_ctor = pcall(function()
+            setting:call(ctor)
+        end)
+        table.insert(lines, "CreateSetting:" .. ctor .. " -> " .. (ok_ctor and "ok" or ("ERR " .. safe_string(err_ctor))))
+        if ok_ctor then break end
+    end
+
+    pcall(function()
+        local td = default_setting:get_type_definition()
+        local depth = 0
+        local seen = {}
+        while td and depth < 8 do
+            local level_name = td:get_full_name() or "?"
+            if seen[level_name] then break end
+            seen[level_name] = true
+            for _, field in ipairs(td:get_fields()) do
+                local name = field:get_name() or ""
+                local ftype = field:get_type()
+                local type_name = ftype and ftype:get_full_name() or ""
+                local value = nil
+                pcall(function() value = default_setting:get_field(name) end)
+                if type_name == "app.CharacterKindID" then
+                    value = kind
+                end
+                local ok_set, err_set = pcall(function() setting:set_field(name, value) end)
+                table.insert(lines, "CreateSetting copy " .. name .. " -> " .. (ok_set and safe_string(value) or ("ERR " .. safe_string(err_set))))
+            end
+            local parent = get_parent_type_definition(td)
+            if not parent then break end
+            td = parent
+            depth = depth + 1
+        end
+    end)
+    return setting
+end
+
+local function schedule_controller_restore(control, old_spawn_context, old_request_end, old_permitted)
+    state.pending_controller_restore = {
+        control = control,
+        old_spawn_context = old_spawn_context,
+        old_request_end = old_request_end,
+        old_permitted = old_permitted,
+        restore_at = now() + 2.0,
+    }
+end
+
+local function restore_controller_fields_if_due(force)
+    local pending = state.pending_controller_restore
+    if not pending then return end
+    if not force and now() < (pending.restore_at or 0) then return end
+    local control = pending.control
+    if control then
+        pcall(function() control:set_field("_SpawnContextID", pending.old_spawn_context) end)
+        if pending.old_request_end ~= nil then
+            pcall(function() control:set_field("IsSpawnRequestEnd", pending.old_request_end) end)
+        end
+        if pending.old_permitted ~= nil then
+            pcall(function() control:set_field("<HasPermittedSpawn>k__BackingField", pending.old_permitted) end)
+        end
+    end
+    state.pending_controller_restore = nil
+end
+
+local function run_controller_grace_spawn_probe()
+    local char_mgr = sdk.get_managed_singleton("app.CharacterManager")
+    if not char_mgr then
+        state.character_spawn_status = "controller spawn failed: CharacterManager not found"
+        return false, state.character_spawn_status
+    end
+
+    local ctx, lines = create_new_context_id()
+    local kind_grace = get_static_field_value("app.CharacterKindID", {"cp_A100"})
+    if not ctx or not kind_grace then
+        state.character_spawn_status = "controller spawn failed: missing ContextID/kind | " .. table.concat(lines, " | ")
+        return false, state.character_spawn_status
+    end
+    pcall(function() ctx = ctx:add_ref() end)
+    state.last_spawn_context = ctx
+    pcall(function() state.last_spawn_context_text = safe_string(ctx:call("ToString")) end)
+
+    local _, control, default_setting, bundle_err = get_spawn_control_bundle(char_mgr, kind_grace, lines)
+    if not control or not default_setting then
+        state.character_spawn_status = "controller spawn failed: " .. bundle_err .. " | " .. table.concat(lines, " | ")
+        state.puppet_status = state.character_spawn_status
+        return false, state.character_spawn_status
+    end
+
+    local duplicate, duplicate_status = duplicate_player_spawn_data(char_mgr, kind_grace, lines)
+    table.insert(lines, "duplicate_status=" .. duplicate_status)
+    if not duplicate then
+        state.character_spawn_status = "controller spawn failed: " .. table.concat(lines, " | ")
+        state.puppet_status = state.character_spawn_status
+        return false, state.character_spawn_status
+    end
+
+    set_fields_by_type_or_name(duplicate, "app.ContextID", {}, ctx, "SpawnData.ContextID", lines)
+    set_fields_by_type_or_name(duplicate, "app.CharacterKindID", {}, kind_grace, "SpawnData.CharacterKindID", lines)
+    pcall(function() duplicate:set_field("<SpawnControl>k__BackingField", control) end)
+
+    local registered = false
+    for _, call_name in ipairs({"registerSpawnData(app.CharacterSpawnData)", "registerSpawnData"}) do
+        local ok_register, err_register = pcall(function()
+            char_mgr:call(call_name, duplicate)
+        end)
+        table.insert(lines, call_name .. "(controller duplicate) -> " .. (ok_register and "ok" or ("ERR " .. safe_string(err_register))))
+        if ok_register then
+            registered = true
+            break
+        end
+    end
+    if not registered then
+        state.character_spawn_status = "controller spawn failed: registerSpawnData failed | " .. table.concat(lines, " | ")
+        state.puppet_status = state.character_spawn_status
+        return false, state.character_spawn_status
+    end
+
+    local setting = make_controller_create_setting(default_setting, kind_grace, lines)
+    local old_spawn_context = nil
+    local old_request_end = nil
+    local old_permitted = nil
+    pcall(function() old_spawn_context = control:get_field("_SpawnContextID") end)
+    pcall(function() old_request_end = control:get_field("IsSpawnRequestEnd") end)
+    pcall(function() old_permitted = control:get_field("<HasPermittedSpawn>k__BackingField") end)
+
+    pcall(function() control:set_field("_SpawnContextID", ctx) end)
+    pcall(function() control:set_field("IsSpawnRequestEnd", false) end)
+    pcall(function() control:set_field("<HasPermittedSpawn>k__BackingField", true) end)
+    schedule_controller_restore(control, old_spawn_context, old_request_end, old_permitted)
+
+    for _, call in ipairs({
+        { name = "setupControlCharacter(app.LevelPlayerCreateController.CreateSetting)", args = { setting } },
+        { name = "app.ICharacterSpawnControl.requestSpawn()", args = {} },
+        { name = "createControlCharacter()", args = {} },
+    }) do
+        local ok_call, err_call = pcall(function()
+            control:call(call.name, unpack_args(call.args))
+        end)
+        table.insert(lines, "Controller:" .. call.name .. " -> " .. (ok_call and "ok" or ("ERR " .. safe_string(err_call))))
+    end
+
+    local context_ref = nil
+    for _, call_name in ipairs({"getContextRef(app.ContextID)", "getContextRef"}) do
+        local ok_ref, result = pcall(function()
+            return char_mgr:call(call_name, ctx)
+        end)
+        table.insert(lines, call_name .. "(controller ctx) -> " .. (ok_ref and safe_string(result) or ("ERR " .. safe_string(result))))
+        if ok_ref and result and not context_ref then
+            context_ref = result
+            pcall(function() context_ref = context_ref:add_ref() end)
+        end
+    end
+
+    if context_ref then
+        pcall(function()
+            local go = context_ref:call("get_GameObject")
+            table.insert(lines, "Controller context get_GameObject -> " .. safe_string(go))
+            if go then
+                state.puppet_go = go:add_ref()
+                state.puppet_xform = go:call("get_Transform")
+                pcall(function() state.puppet_xform = state.puppet_xform:add_ref() end)
+            end
+        end)
+        pcall(function()
+            local updater = context_ref:call("get_Updater")
+            table.insert(lines, "Controller context get_Updater -> " .. safe_string(updater))
+        end)
+    end
+
+    dump_spawn_hook_log(true)
+    pcall(function()
+        json.dump_file(DATA_PREFIX .. "controller_spawn_probe.json", {
+            time_ms = now_ms(),
+            scene = get_current_scene(),
+            context = state.last_spawn_context_text,
+            ok = true,
+            lines = lines,
+        })
+    end)
+
+    state.character_spawn_status = "controller spawn probe sent for " .. safe_string(state.last_spawn_context_text)
+    state.puppet_status = context_ref and "Controller context created; check for Grace" or "Controller spawn sent; waiting for context"
+    return true, state.character_spawn_status
+end
+
 local function disable_puppet_components(go)
     pcall(function()
         local components = go:call("get_Components")
@@ -2777,6 +3139,8 @@ local function poll_dev_command()
         ok, message = run_request_spawn_registered_duplicate()
     elseif action == "spawn_ready_duplicate" then
         ok, message = run_ready_registered_duplicate()
+    elseif action == "spawn_controller_grace" then
+        ok, message = run_controller_grace_spawn_probe()
     elseif action == "context_create_probe" then
         ok, message = run_context_create_probe()
     elseif action == "set_prefab" then
@@ -3112,6 +3476,10 @@ local function draw_main_window()
     if imgui.button("Try Ready Grace Spawn") then
         run_ready_registered_duplicate()
     end
+    imgui.same_line()
+    if imgui.button("Try Controller Grace Spawn") then
+        run_controller_grace_spawn_probe()
+    end
     if imgui.button("Probe New ContextID") then
         run_context_create_probe()
     end
@@ -3178,6 +3546,7 @@ re.on_frame(function()
         poll_dev_command()
         state.last_dev_poll = t
     end
+    restore_controller_fields_if_due(false)
     update_local_dummy()
     if cfg.auto_runtime_diagnostics and state.local_ok then
         dump_runtime_diagnostics()
