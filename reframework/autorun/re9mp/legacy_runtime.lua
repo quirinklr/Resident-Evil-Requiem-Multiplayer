@@ -20,7 +20,17 @@ local chunk_paths = {
     "runtime/legacy_80_commands_ui_callbacks.lua",
 }
 
+local function script_dir()
+    local info = debug and debug.getinfo and debug.getinfo(1, "S")
+    local source = info and info.source or ""
+    if source:sub(1, 1) == "@" then
+        source = source:sub(2)
+    end
+    return source:match("^(.*[\\/])[^\\/]*$") or ""
+end
+
 local base_paths = {
+    script_dir(),
     "reframework/autorun/re9mp/",
     "autorun/re9mp/",
     "re9mp/",

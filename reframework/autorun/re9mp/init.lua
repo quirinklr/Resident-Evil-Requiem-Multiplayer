@@ -14,8 +14,19 @@ local function write_init_error(message)
     end)
 end
 
+local function script_dir()
+    local info = debug and debug.getinfo and debug.getinfo(1, "S")
+    local source = info and info.source or ""
+    if source:sub(1, 1) == "@" then
+        source = source:sub(2)
+    end
+    return source:match("^(.*[\\/])[^\\/]*$") or ""
+end
+
 local function load_legacy_runtime()
+    local dir = script_dir()
     local candidates = {
+        dir .. "legacy_runtime.lua",
         "reframework/autorun/re9mp/legacy_runtime.lua",
         "autorun/re9mp/legacy_runtime.lua",
         "re9mp/legacy_runtime.lua",

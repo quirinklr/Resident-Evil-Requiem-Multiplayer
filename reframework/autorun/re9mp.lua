@@ -11,6 +11,15 @@ local function write_bootstrap_error(message)
     end)
 end
 
+local function script_dir()
+    local info = debug and debug.getinfo and debug.getinfo(1, "S")
+    local source = info and info.source or ""
+    if source:sub(1, 1) == "@" then
+        source = source:sub(2)
+    end
+    return source:match("^(.*[\\/])[^\\/]*$") or ""
+end
+
 local function run_first_existing(paths)
     local last_error = ""
     for _, path in ipairs(paths) do
@@ -25,7 +34,9 @@ local function run_first_existing(paths)
     return false, last_error
 end
 
+local dir = script_dir()
 local ok, err = run_first_existing({
+    dir .. "re9mp/init.lua",
     "reframework/autorun/re9mp/init.lua",
     "autorun/re9mp/init.lua",
     "re9mp/init.lua",
