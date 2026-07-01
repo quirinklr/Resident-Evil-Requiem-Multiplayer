@@ -1,6 +1,6 @@
 # RE9MP Progress Tracker
 
-Last updated: 2026-07-01 16:35 CEST
+Last updated: 2026-07-01 18:15 CEST
 
 Current target progress:
 
@@ -8,7 +8,7 @@ Current target progress:
   `registered_player_material_lit` erzeugt inzwischen eine sichtbare, grafisch korrekte zweite Grace: 25/25 MeshUnits werden registriert, Material und Mesh sind ready, Depth/Shading/Occlusion sehen korrekt aus, und der Spawn blieb in den Tests stabil. Die letzten fehlenden 10% sind bewusst offen, weil sie noch keine Animation hat und technisch weiter an der lokalen Grace-Hierarchy hängt; bei Yaw/Pitch oder Bewegung glitched sie durch Transform-Fighting.
 
 - Goal 2, networked Grace clone: 60%
-  Die native Host/Client-Verbindung, Tailscale-UDP, Build/Scene-Handshake und Remote-Snapshots funktionieren grundsätzlich, und es gibt jetzt einen sichtbaren Grace-Puppet, den Netzwerkdaten theoretisch antreiben können. Die Bewertung bleibt bei 60%, weil die aktuelle sichtbare Variante noch kein unabhängiger Remote-Character ist: sie braucht eine eigene Scene-/Render-Root-Lösung oder einen sauberen MeshController-Kontext, bevor echte Remote-Transformführung und Animation belastbar sind.
+  Die native Host/Client-Verbindung, Tailscale-UDP, Build/Scene-Handshake und Remote-Snapshots funktionieren grundsätzlich, und es gibt jetzt einen sichtbaren Grace-Puppet, den Netzwerkdaten theoretisch antreiben können. Der neueste Load-Phase-Test kann zusätzlich eine zweite `app.PlayerContext`-ID für `cp_A100` erzeugen und über `readyContext/restoreContext` in `CharacterManager` registrieren. Die Bewertung bleibt bei 60%, weil die aktuelle sichtbare Variante noch kein unabhängiger Remote-Character ist und der Engine-owned Context bisher noch keine sauber separate sichtbare Grace liefert.
 
 # RE9 Multiplayer MVP
 

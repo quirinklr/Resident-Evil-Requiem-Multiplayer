@@ -87,6 +87,25 @@ This file is the project memory for RE9 Requiem multiplayer reverse engineering.
   - `resource_probe` produced visible in-game `[Missing file]` overlay messages for guessed `ch0100_01_*.pfb` path variants. Treat this as a negative test for the current `sdk.create_resource("via.Prefab", guessed_path)` approach. Do not repeat the broad prefab probe during normal testing; it is noisy and did not produce a usable resource.
   - New implementation branch: `raw_gameobject_clone_probe` bypasses the visual mesh clone path and directly tests no-arg clone/copy/duplicate/instantiate methods on the real local `cp_A100` GameObject. This exists because the old `spawn_puppet` path reaches the successful visual mesh clone first and therefore hides whether RE Engine exposes a usable full-GameObject clone path.
 
+## Current Engine-Owned Context Status
+
+- The `PlayerContextIDHolder` path is now understood better than before:
+  - `LevelPlayerCreateController:getAllManagedContextID()` is derived from `CharacterManager.<PlayerContextIDHolder>k__BackingField`, not a durable source to mutate directly.
+  - A fresh `app.ContextIDReserverWithEnumeration<app.CharacterKindID>` can be constructed and placed in a managed array with `sdk.create_managed_array(...)`, but registering a second holder for the same `cp_A100` does not override the already-active mapping.
+  - Mutating the existing `cp_A100` holder works only if `_RawContextID` is followed by restoring `_BindTarget="cp_A100"` and `_Cache=CharacterKindID.cp_A100`; otherwise `get_BindTarget()` and `getPlayerContextID(cp_A100)` go empty.
+- Latest successful load-phase result:
+  - `arm_load_phase_player_clone_injection setup_create` during Main Menu -> `Chap1_01` produced a new ContextID `07eab937-e620-4e59-a5e8-c00193692622`.
+  - `getPlayerContextID(cp_A100)` temporarily returned that new ID.
+  - The trace captured `readyContext(new, cp_A100, factory, false)` and `restoreContext(new, app.PlayerContext)`.
+  - After `createControlCharacter()`, `CharacterManager:isUsedContext(new)` became `true`, `getContextRef(new)` returned `app.PlayerContext`, and later probing showed a valid GameObject, Transform, `app.Cp_A100Updater`, and `PlayerSpawnData`.
+- Critical caveat:
+  - The `setup_create` branch is not the final architecture because `createControlCharacter()` follows the local control-character path. It eventually triggered `onChangeActivePlayer(empty -> new)` and effectively made the injected context the active local player mapping.
+  - This proves the engine-owned context path is reachable, but it is not yet a safe independent remote-character spawn.
+- Current next branch:
+  - `setup_request_spawn` now runs `setupControlCharacter(...)` to create/register the new context, then calls `CharacterManager:requestSpawn(new, cp_A100, MontageID.Invalid, 0, false, Default)` instead of `createControlCharacter()`.
+  - The purpose is to test whether the engine can allocate/finalize a visible `Cp_A100Updater`/GameObject for the new context without hijacking `onChangeActivePlayer`.
+  - If `setup_request_spawn` still hijacks or stays invisible, the next target is the pool/updater allocation boundary, not more mesh-parent compensation.
+
 ## Network Facts
 
 - Host UDP port: `27777`.
@@ -429,18 +448,19 @@ These are not facts yet:
 
 - Preserve `spawn_visual_mesh_clone_registered_material_lit` only as the visible parented proof/control path. It is useful as a rendering/material control, not as the final architecture.
 - The Main Menu -> gameplay ownership trace is complete. Do not repeat it unless the hook set changes; the useful files are `level_load_trace.json`, `bind_trace.json`, `pool_trace.json`, `spawn_hook_log.json`, and `grace_ownership_recipe.json`.
-- Next runtime pass is the opt-in load-phase injection:
+- Next runtime pass is the opt-in load-phase `setup_request_spawn` injection:
   - Return to the Main Menu.
-  - Reload Lua, run `runtime_safety_status`, then run `arm_load_phase_player_clone_injection` with default `setup_create`.
+  - Reload Lua, run `runtime_safety_status`, then run `arm_load_phase_player_clone_injection` with `setup_request_spawn`.
   - Load the save/level into `Chap1_01` and wait until Grace is controllable.
   - Run `dump_load_phase_injection_probe`, then inspect `load_phase_injection_probe.json`, `pool_trace.json`, and `level_load_trace.json`.
 - Success criteria:
   - A fresh injected ContextID appears in `CharacterManager:getContextRef(...)`.
-  - Best case: it also gets a GameObject, `app.Cp_A100Updater`, and a used/finalized CharacterPool entry.
-  - Visual best case: a second Grace appears without being parented to local Grace.
+  - It gets a GameObject, `app.Cp_A100Updater`, and a used/finalized CharacterPool entry without `onChangeActivePlayer(empty -> new)`.
+  - Visual best case: a second Grace appears without being parented to local Grace and local camera yaw/pitch no longer moves it.
 - Failure criteria:
-  - If no context appears even during the load window, `LevelPlayerCreateController` is likely hard-gated to the real player setup. Move next to real prefab/montage spawn using confirmed asset paths and stop trying controller replay.
-  - If a context appears but no GameObject/updater, keep the evidence and test the missing pool/updater allocation step directly.
+  - If the context appears but stays without GameObject/updater, test the missing pool/updater allocation step directly.
+  - If the context gets GameObject/updater but becomes active local player, stop using `createControlCharacter()`-style paths for the remote clone and isolate the non-control spawn boundary.
+  - If no context appears during the load window, `LevelPlayerCreateController` is likely hard-gated to the real player setup. Move next to real prefab/montage spawn using confirmed asset paths and stop trying controller replay.
 - Do not run clone spawns during the listener pass.
 - Do not run per-slot material texture copy again; avoid `via.render.Mesh.getMaterialTexture` in the clone spawn path.
 - Do not call `via.render.Mesh.set_SharedSkeletonGameObject(...)`, `app.CharacterMeshControllerBase.notifyMeshUnitChanged()`, or `via.render.Mesh.set_MaterialParamCount` in a live clone path unless a new isolated test proves them safe.
