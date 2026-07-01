@@ -1,24 +1,14 @@
 # RE9MP Progress Tracker
 
-Last updated: 2026-07-01 08:40 CEST
+Last updated: 2026-07-01 16:35 CEST
 
 Current target progress:
 
-- Goal 1, local visible Grace clone: 55%
-- Goal 2, networked Grace clone: 45%
+- Goal 1, local visible Grace clone: 90%
+  `registered_player_material_lit` erzeugt inzwischen eine sichtbare, grafisch korrekte zweite Grace: 25/25 MeshUnits werden registriert, Material und Mesh sind ready, Depth/Shading/Occlusion sehen korrekt aus, und der Spawn blieb in den Tests stabil. Die letzten fehlenden 10% sind bewusst offen, weil sie noch keine Animation hat und technisch weiter an der lokalen Grace-Hierarchy hängt; bei Yaw/Pitch oder Bewegung glitched sie durch Transform-Fighting.
 
-Why this percentage:
-
-- 2026-07-01 08:40 CEST: Goal 1 raised to 55% because the local player, scene, `Cp_A100Updater`, `PlayerMeshController`, `ActorPlayerMeshController`, and 14 live `app.MeshUnit` entries are now confirmed. Each MeshUnit exposes a real `via.GameObject` and `via.render.Mesh`, so the next local-spawn path is visual cloning/instancing of Grace mesh units instead of duplicating `PlayerContext`. It is not higher because no second visible Grace has spawned yet.
-- 2026-07-01 08:40 CEST: Goal 2 remains 45% because host/client Tailscale UDP, scene/build handshake, movement snapshots, ping, and remote transform math already worked in a two-PC test. It is blocked behind Goal 1 because the network can move a remote pose, but there is still no local visual Grace puppet to attach that pose to.
-
-How this tracker is maintained:
-
-- Only update percentages after a concrete in-game test, generated diagnostic JSON, or code change proves new capability.
-- Every percentage change must add one short dated reason under `Why this percentage`.
-- Goal 1 measures: spawn or construct a second visible Grace locally, then move/despawn it safely.
-- Goal 2 measures: drive that local Grace puppet from remote network snapshots over Tailscale.
-- Failed paths stay documented in `docs/REVERSE_ENGINEERING_MEMORY.md` so the same dead end is not retried later.
+- Goal 2, networked Grace clone: 60%
+  Die native Host/Client-Verbindung, Tailscale-UDP, Build/Scene-Handshake und Remote-Snapshots funktionieren grundsätzlich, und es gibt jetzt einen sichtbaren Grace-Puppet, den Netzwerkdaten theoretisch antreiben können. Die Bewertung bleibt bei 60%, weil die aktuelle sichtbare Variante noch kein unabhängiger Remote-Character ist: sie braucht eine eigene Scene-/Render-Root-Lösung oder einen sauberen MeshController-Kontext, bevor echte Remote-Transformführung und Animation belastbar sind.
 
 # RE9 Multiplayer MVP
 

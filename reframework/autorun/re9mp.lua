@@ -15,6 +15,9 @@ local BIND_TRACE_FILE = DATA_PREFIX .. "bind_trace.json"
 local RESOURCE_PROBE_FILE = DATA_PREFIX .. "resource_probe.json"
 local COMPONENT_RESOURCE_PROBE_FILE = DATA_PREFIX .. "component_resource_probe.json"
 local VISUAL_COMPONENT_PROBE_FILE = DATA_PREFIX .. "visual_component_probe.json"
+local VISUAL_SPAWN_PROBE_FILE = DATA_PREFIX .. "visual_spawn_probe.json"
+local MESH_REGISTRATION_PROBE_FILE = DATA_PREFIX .. "mesh_registration_probe.json"
+GRACE_OWNERSHIP_RECIPE_FILE = DATA_PREFIX .. "grace_ownership_recipe.json"
 local LOCAL_FILE = DATA_PREFIX .. "local_snapshot.json"
 local STATUS_FILE = DATA_PREFIX .. "status.json"
 local REMOTE_FILE = DATA_PREFIX .. "remote_snapshot.json"
@@ -23,9 +26,13 @@ local cfg = {
     window_open = true,
     join_code = "",
     command_id = 0,
-    auto_spawn_puppet = true,
+    auto_spawn_puppet = false,
     draw_remote_marker = true,
     local_dummy = false,
+    dummy_offset_x = nil,
+    dummy_offset_y = 0,
+    dummy_offset_z = nil,
+    visual_clone_mode = "shared_skeleton",
     prefab_path = "",
     auto_runtime_diagnostics = false,
     level_trace_enabled = false,
@@ -87,6 +94,11 @@ local state = {
     dummy_last_time = 0,
     puppet_go = nil,
     puppet_xform = nil,
+    puppet_anchor_go = nil,
+    puppet_root_parented = false,
+    puppet_local_hierarchy = false,
+    puppet_independent_root = false,
+    puppet_visual_units = {},
     puppet_status = "not spawned",
     puppet_last_attempt = 0,
     clone_candidates = "",
@@ -106,17 +118,18 @@ local state = {
     dev_last_id = 0,
     dev_status = "",
     spawn_hook_attempted = false,
+    spawn_hook_enabled = false,
     spawn_hook_status = "not installed",
     spawn_hook_events = {},
     spawn_hook_dirty = false,
-    level_trace_enabled = cfg.level_trace_enabled and true or false,
+    level_trace_enabled = false,
     level_trace_status = "waiting",
     level_trace_events = {},
     level_trace_dirty = false,
     level_trace_started_ms = 0,
     level_trace_last_dump = 0,
     level_trace_last_scene = "",
-    pool_trace_enabled = cfg.pool_trace_enabled and true or false,
+    pool_trace_enabled = false,
     pool_trace_status = "waiting",
     pool_trace_events = {},
     pool_trace_dirty = false,
@@ -125,10 +138,11 @@ local state = {
     pool_trace_last_sample = 0,
     pool_trace_last_scene = "",
     pool_trace_last_signature = "",
-    bind_trace_enabled = cfg.bind_trace_enabled and true or false,
+    bind_trace_enabled = false,
     bind_trace_attempted = false,
     bind_trace_status = "waiting",
     bind_trace_events = {},
+    bind_trace_errors = {},
     bind_trace_dirty = false,
     bind_trace_started_ms = 0,
     bind_trace_last_dump = 0,
@@ -139,6 +153,19 @@ local state = {
     last_spawn_context = nil,
     last_spawn_context_text = "",
     pending_controller_restore = nil,
+    load_phase_injection_armed = false,
+    load_phase_injection_done = false,
+    load_phase_injection_guard = false,
+    load_phase_injection_mode = "",
+    load_phase_injection_status = "",
+    load_phase_injection_lines = {},
+    load_phase_injection_context = nil,
+    load_phase_injection_context_text = "",
+    load_phase_injection_pending_control = nil,
+    load_phase_injection_pending_setting = nil,
+    load_phase_injection_pre_lines = {},
+    load_phase_injection_followup_until = 0,
+    load_phase_injection_next_dump = 0,
 }
 
 local function get_current_scene()
@@ -209,6 +236,17 @@ end
 local function read_position(xform)
     local pos = nil
     pcall(function() pos = xform:call("get_Position") end)
+    if not pos then return nil end
+    return {
+        x = float_field(pos, "x", 0),
+        y = float_field(pos, "y", 0),
+        z = float_field(pos, "z", 0),
+    }
+end
+
+function read_local_position(xform)
+    local pos = nil
+    pcall(function() pos = xform:call("get_LocalPosition") end)
     if not pos then return nil end
     return {
         x = float_field(pos, "x", 0),
@@ -361,6 +399,54 @@ local function yaw_forward_from_snapshot(snap)
     return fx / len, fz / len
 end
 
+function quat_conjugate(q)
+    return {
+        x = -(q and q.x or 0),
+        y = -(q and q.y or 0),
+        z = -(q and q.z or 0),
+        w = q and q.w or 1,
+    }
+end
+
+function quat_multiply(a, b)
+    a = a or { x = 0, y = 0, z = 0, w = 1 }
+    b = b or { x = 0, y = 0, z = 0, w = 1 }
+    return {
+        x = ((a.w or 1) * (b.x or 0)) + ((a.x or 0) * (b.w or 1)) + ((a.y or 0) * (b.z or 0)) - ((a.z or 0) * (b.y or 0)),
+        y = ((a.w or 1) * (b.y or 0)) - ((a.x or 0) * (b.z or 0)) + ((a.y or 0) * (b.w or 1)) + ((a.z or 0) * (b.x or 0)),
+        z = ((a.w or 1) * (b.z or 0)) + ((a.x or 0) * (b.y or 0)) - ((a.y or 0) * (b.x or 0)) + ((a.z or 0) * (b.w or 1)),
+        w = ((a.w or 1) * (b.w or 1)) - ((a.x or 0) * (b.x or 0)) - ((a.y or 0) * (b.y or 0)) - ((a.z or 0) * (b.z or 0)),
+    }
+end
+
+function snapshot_rotation(snap)
+    return {
+        x = snap and snap.qx or 0,
+        y = snap and snap.qy or 0,
+        z = snap and snap.qz or 0,
+        w = snap and snap.qw or 1,
+    }
+end
+
+function pose_rotation(pose)
+    return {
+        x = pose and pose.qx or 0,
+        y = pose and pose.qy or 0,
+        z = pose and pose.qz or 0,
+        w = pose and pose.qw or 1,
+    }
+end
+
+function world_delta_to_local_yaw(snap, dx, dy, dz)
+    local fx, fz = yaw_forward_from_snapshot(snap)
+    local side_x, side_z = fz, -fx
+    return {
+        x = ((dx or 0) * side_x) + ((dz or 0) * side_z),
+        y = dy or 0,
+        z = ((dx or 0) * fx) + ((dz or 0) * fz),
+    }
+end
+
 local function update_local_dummy()
     if not cfg.local_dummy then return end
     local snap = state.local_snapshot
@@ -370,20 +456,27 @@ local function update_local_dummy()
     state.dummy_last_time = t
     state.dummy_seq = state.dummy_seq + 1
 
-    local fx, fz = yaw_forward_from_snapshot(snap)
-    local side_x, side_z = fz, -fx
-    local distance = 2.4
-    local sway = math.sin(t * 1.8) * 0.45
-    local px = (snap.px or 0) + (fx * distance) + (side_x * sway)
-    local pz = (snap.pz or 0) + (fz * distance) + (side_z * sway)
-    local vx = (side_x * math.cos(t * 1.8) * 0.81)
-    local vz = (side_z * math.cos(t * 1.8) * 0.81)
+    local px, py, pz, vx, vz = nil, snap.py or 0, nil, 0, 0
+    if cfg.dummy_offset_x ~= nil and cfg.dummy_offset_z ~= nil then
+        px = (snap.px or 0) + (tonumber(cfg.dummy_offset_x) or 0)
+        py = (snap.py or 0) + (tonumber(cfg.dummy_offset_y) or 0)
+        pz = (snap.pz or 0) + (tonumber(cfg.dummy_offset_z) or 0)
+    else
+        local fx, fz = yaw_forward_from_snapshot(snap)
+        local side_x, side_z = fz, -fx
+        local distance = 2.4
+        local sway = math.sin(t * 1.8) * 0.45
+        px = (snap.px or 0) + (fx * distance) + (side_x * sway)
+        pz = (snap.pz or 0) + (fz * distance) + (side_z * sway)
+        vx = (side_x * math.cos(t * 1.8) * 0.81)
+        vz = (side_z * math.cos(t * 1.8) * 0.81)
+    end
     local dummy = {
         valid = true,
         seq = state.dummy_seq,
         scene = snap.scene,
         px = px,
-        py = snap.py or 0,
+        py = py,
         pz = pz,
         qx = 0,
         qy = snap.qy or 0,
@@ -400,6 +493,44 @@ local function update_local_dummy()
     while #state.remote_samples > 12 do
         table.remove(state.remote_samples, 1)
     end
+end
+
+function set_static_dummy_ahead(distance)
+    local snap = state.local_snapshot
+    if not snap or not snap.valid then
+        snap = make_local_snapshot()
+    end
+    if not snap or not snap.valid then
+        return false, "static dummy failed: no local snapshot"
+    end
+
+    local fx, fz = yaw_forward_from_snapshot(snap)
+    local d = tonumber(distance) or 2.4
+    state.dummy_seq = state.dummy_seq + 1
+    local t = now()
+    local dummy = {
+        valid = true,
+        seq = state.dummy_seq,
+        scene = snap.scene,
+        px = (snap.px or 0) + (fx * d),
+        py = snap.py or 0,
+        pz = (snap.pz or 0) + (fz * d),
+        qx = 0,
+        qy = snap.qy or 0,
+        qz = 0,
+        qw = snap.qw or 1,
+        vx = 0,
+        vy = 0,
+        vz = 0,
+        flags = 1,
+        motion = "static_dummy",
+        stance = "static_dummy",
+    }
+    state.remote_samples = { { t = t, data = dummy } }
+    state.remote_last_seq = nil
+    cfg.local_dummy = false
+    save_cfg()
+    return true, string.format("static_dummy=true ahead=%.1fm", d)
 end
 
 local function lerp(a, b, f)
@@ -699,6 +830,12 @@ local function describe_hook_arg(arg)
     return out
 end
 
+local function hook_arg_to_managed(arg)
+    local obj = nil
+    pcall(function() obj = sdk.to_managed_object(arg) end)
+    return obj
+end
+
 local function reset_level_trace(reason)
     state.level_trace_events = {}
     state.level_trace_dirty = true
@@ -729,7 +866,7 @@ local function push_level_trace_event(method_name, args, phase, retval, max_args
         event.retval = describe_hook_arg(retval)
     end
     table.insert(state.level_trace_events, event)
-    while #state.level_trace_events > 1200 do
+    while #state.level_trace_events > 3000 do
         table.remove(state.level_trace_events, 1)
     end
     state.level_trace_dirty = true
@@ -746,7 +883,7 @@ local function push_level_trace_note(note)
         method = safe_string(note),
         args = {},
     })
-    while #state.level_trace_events > 1200 do
+    while #state.level_trace_events > 3000 do
         table.remove(state.level_trace_events, 1)
     end
     state.level_trace_dirty = true
@@ -787,6 +924,21 @@ local function trace_call(obj, method_name)
     return value
 end
 
+function re9mp_trace_value(obj, methods, fields)
+    if not obj then return nil end
+    for _, method_name in ipairs(methods or {}) do
+        local value = nil
+        pcall(function() value = obj:call(method_name) end)
+        if value ~= nil then return value end
+    end
+    for _, field_name in ipairs(fields or {}) do
+        local value = nil
+        pcall(function() value = obj:get_field(field_name) end)
+        if value ~= nil then return value end
+    end
+    return nil
+end
+
 local function trace_count(obj)
     local count = nil
     pcall(function() if obj then count = obj:call("get_Count") end end)
@@ -823,6 +975,12 @@ local function trace_context_summary(ctx, index)
     row.updater = safe_string(updater)
     row.updater_type = trace_type_name(updater)
     row.transform = safe_string(trace_call(ctx, "get_Transform"))
+    row.context_id = safe_string(re9mp_trace_value(ctx, {"get_ContextID"}, {
+        "<ContextID>k__BackingField", "_ContextID", "ContextID",
+    }))
+    row.character_kind_id = safe_string(re9mp_trace_value(ctx, {"get_CharacterKindID"}, {
+        "<CharacterKindID>k__BackingField", "_CharacterKindID", "CharacterKindID",
+    }))
     row.active = trace_call(ctx, "get_IsActivePlayer")
     row.tps = trace_call(ctx, "get_IsTPSCharacter")
     row.fps = trace_call(ctx, "get_IsFPSCharacter")
@@ -856,6 +1014,70 @@ local function trace_pool_summary(pool, index)
     row.updater_transform = safe_string(trace_call(updater, "get_Transform"))
     row.updater_context = safe_string(trace_call(updater, "get_Context"))
     row.updater_owner = safe_string(trace_call(updater, "get_Owner"))
+    row.context_id = safe_string(re9mp_trace_value(updater, {"get_ContextID"}, {
+        "<ContextID>k__BackingField", "_ContextID", "ContextID",
+    }))
+    row.character_kind_id = safe_string(re9mp_trace_value(updater, {"get_CharacterKindID"}, {
+        "<CharacterKindID>k__BackingField", "_CharacterKindID", "CharacterKindID",
+    }))
+    return row
+end
+
+function re9mp_trace_mesh_controller_summary(controller, label)
+    local row = {
+        label = safe_string(label or ""),
+        ref = safe_string(controller),
+        type = trace_type_name(controller),
+        counts = {},
+    }
+    if not controller then return row end
+
+    local go = trace_call(controller, "get_GameObject")
+    local dict = nil
+    local mesh_list = nil
+    local mesh_parts = nil
+    local property_values = nil
+    pcall(function() dict = controller:get_field("<MeshUnitDictionary>k__BackingField") end)
+    pcall(function() mesh_list = controller:get_field("_MeshList") end)
+    pcall(function() mesh_parts = controller:get_field("_MeshPartsDictionary") end)
+    pcall(function() property_values = controller:get_field("_PropertyValueContainers") end)
+
+    row.game_object = safe_string(go)
+    row.game_object_name = safe_string(trace_call(go, "get_Name"))
+    row.transform = safe_string(trace_call(go, "get_Transform"))
+    row.counts.mesh_unit_dictionary = trace_count(dict)
+    row.counts.mesh_list = trace_count(mesh_list)
+    row.counts.mesh_parts_dictionary = trace_count(mesh_parts)
+    row.counts.property_value_containers = trace_count(property_values)
+    row.mesh_unit_dictionary = safe_string(dict)
+    row.mesh_list = safe_string(mesh_list)
+    row.mesh_parts_dictionary = safe_string(mesh_parts)
+    row.property_value_containers = safe_string(property_values)
+    return row
+end
+
+function re9mp_trace_mesh_unit_summary(unit, index)
+    local row = {
+        index = index,
+        ref = safe_string(unit),
+        type = trace_type_name(unit),
+    }
+    if not unit then return row end
+
+    local go = trace_call(unit, "get_GameObject")
+    local mesh = trace_call(unit, "get_Mesh")
+    local mesh_go = trace_call(mesh, "get_GameObject")
+    row.mesh_type = safe_string(trace_call(unit, "get_MeshType"))
+    row.game_object = safe_string(go)
+    row.game_object_name = safe_string(trace_call(go, "get_Name"))
+    row.transform = safe_string(trace_call(go, "get_Transform"))
+    row.position = read_position(trace_call(go, "get_Transform"))
+    row.mesh = safe_string(mesh)
+    row.mesh_type_name = trace_type_name(mesh)
+    row.mesh_game_object = safe_string(mesh_go)
+    row.mesh_game_object_name = safe_string(trace_call(mesh_go, "get_Name"))
+    row.mesh_controller = safe_string(trace_call(unit, "get_MeshController"))
+    row.parent_mesh_controller = safe_string(trace_call(unit, "get_ParentMeshController"))
     return row
 end
 
@@ -966,6 +1188,7 @@ end
 
 local function reset_bind_trace(reason)
     state.bind_trace_events = {}
+    state.bind_trace_errors = {}
     state.bind_trace_dirty = true
     state.bind_trace_started_ms = now_ms()
     state.bind_trace_status = "recording: " .. safe_string(reason or "manual")
@@ -980,6 +1203,17 @@ local function describe_bind_object(obj)
 
     if row.type:find("CharacterPoolInfo", 1, true) then
         row.pool = trace_pool_summary(obj, -1)
+    elseif row.type:find("MeshUnit", 1, true) then
+        row.mesh_unit = re9mp_trace_mesh_unit_summary(obj, -1)
+    elseif row.type:find("MeshController", 1, true) then
+        row.mesh_controller = re9mp_trace_mesh_controller_summary(obj, "bind_arg")
+    elseif row.type:find("via.render.Mesh", 1, true) then
+        local go = trace_call(obj, "get_GameObject")
+        row.mesh = {
+            game_object = safe_string(go),
+            game_object_name = safe_string(trace_call(go, "get_Name")),
+            transform = safe_string(trace_call(go, "get_Transform")),
+        }
     elseif row.type:find("Updater", 1, true) then
         row.game_object = safe_string(trace_call(obj, "get_GameObject"))
         row.transform = safe_string(trace_call(obj, "get_Transform"))
@@ -992,13 +1226,14 @@ local function describe_bind_object(obj)
     return row
 end
 
-local function push_bind_trace_event(method_name, args, max_args)
+local function push_bind_trace_event(method_name, args, max_args, phase, retval)
     if not state.bind_trace_enabled then return end
 
     local event = {
         time_ms = now_ms(),
         dt_ms = math.max(0, now_ms() - (state.bind_trace_started_ms or 0)),
         scene = get_current_scene(),
+        phase = phase or "pre",
         method = method_name,
         args = {},
         counts = {},
@@ -1041,9 +1276,16 @@ local function push_bind_trace_event(method_name, args, max_args)
         end)
         table.insert(event.args, arg)
     end
+    if retval ~= nil then
+        event.retval = describe_hook_arg(retval)
+        pcall(function()
+            local obj = sdk.to_managed_object(retval)
+            if obj then event.retval.object = describe_bind_object(obj) end
+        end)
+    end
 
     table.insert(state.bind_trace_events, event)
-    while #state.bind_trace_events > 1500 do
+    while #state.bind_trace_events > 5000 do
         table.remove(state.bind_trace_events, 1)
     end
     state.bind_trace_dirty = true
@@ -1061,6 +1303,7 @@ local function dump_bind_trace(force)
             scene = get_current_scene(),
             started_ms = state.bind_trace_started_ms,
             events = state.bind_trace_events,
+            errors = state.bind_trace_errors or {},
         })
     end)
 end
@@ -1071,6 +1314,8 @@ local function install_bind_trace_hooks()
 
     local ok, err = pcall(function()
         local installed = 0
+        local hooked = {}
+        local hook_errors = {}
         local targets = {
             {"app.CharacterPoolInfo", {
                 set_GameObjectFinalized = true,
@@ -1094,6 +1339,43 @@ local function install_bind_trace_hooks()
                 set_Context = true,
                 set_Owner = true,
             }},
+            {"app.CharacterMeshControllerBase", {
+                registerMeshUnit = true,
+                registerMeshUnitOnSubMontage = true,
+                unregisterMeshUnit = true,
+                searchInitMeshUnits = true,
+                setupMeshUnit = true,
+                setupMeshUnits = true,
+                initialize = true,
+                onInitialize = true,
+            }},
+            {"app.PlayerMeshController", {
+                registerMeshUnit = true,
+                registerMeshUnitOnSubMontage = true,
+                unregisterMeshUnit = true,
+                searchInitMeshUnits = true,
+                setupMeshUnit = true,
+                setupMeshUnits = true,
+                initialize = true,
+                onInitialize = true,
+            }},
+            {"app.ActorPlayerMeshController", {
+                registerMeshUnit = true,
+                registerMeshUnitOnSubMontage = true,
+                unregisterMeshUnit = true,
+                searchInitMeshUnits = true,
+                setupMeshUnit = true,
+                setupMeshUnits = true,
+                initialize = true,
+                onInitialize = true,
+            }},
+            {"app.MeshUnit", {
+                [".ctor"] = true,
+                setDrawAndUpdate = true,
+                setDrawDefault = true,
+                setDrawShadow = true,
+                changeMeshType = true,
+            }},
         }
 
         for _, target in ipairs(targets) do
@@ -1111,18 +1393,32 @@ local function install_bind_trace_hooks()
                             local param_types = method:get_param_types()
                             arg_limit = (param_types and #param_types or 0) + 2
                         end)
-                        sdk.hook(method, function(args)
-                            pcall(function() push_bind_trace_event(label, args, arg_limit) end)
-                        end, function(retval)
-                            return retval
-                        end)
-                        installed = installed + 1
+                        local hook_key = safe_string(method)
+                        if hook_key == "" then hook_key = label end
+                        if not hooked[hook_key] then
+                            hooked[hook_key] = true
+                            local hook_ok, hook_err = pcall(function()
+                                sdk.hook(method, function(args)
+                                    pcall(function() push_bind_trace_event(label, args, arg_limit, "pre", nil) end)
+                                end, function(retval)
+                                    pcall(function() push_bind_trace_event(label, nil, 0, "post", retval) end)
+                                    return retval
+                                end)
+                            end)
+                            if hook_ok then
+                                installed = installed + 1
+                            else
+                                table.insert(hook_errors, label .. ": " .. safe_string(hook_err))
+                            end
+                        end
                     end
                 end
             end
         end
 
+        state.bind_trace_errors = hook_errors
         state.bind_trace_status = "installed " .. tostring(installed) .. " bind hooks"
+            .. (#hook_errors > 0 and (" errors=" .. tostring(#hook_errors)) or "")
         dump_bind_trace(true)
     end)
 
@@ -1133,6 +1429,7 @@ local function install_bind_trace_hooks()
 end
 
 local function push_spawn_hook_event(method_name, args, max_args)
+    if not state.spawn_hook_enabled and not state.level_trace_enabled then return end
     local event = {
         time_ms = now_ms(),
         scene = get_current_scene(),
@@ -1146,7 +1443,7 @@ local function push_spawn_hook_event(method_name, args, max_args)
         event.args[i] = describe_hook_arg(arg)
     end
     table.insert(state.spawn_hook_events, event)
-    while #state.spawn_hook_events > 500 do
+    while #state.spawn_hook_events > 1500 do
         table.remove(state.spawn_hook_events, 1)
     end
     state.spawn_hook_dirty = true
@@ -1180,6 +1477,10 @@ local function install_spawn_observer_hooks()
         local observe = {
             requestSpawn = true,
             requestInstantiateMontage = true,
+            getAndRequestSpawnOwner = true,
+            clearSpawnOwner = true,
+            makeSpawnControlBackupData = true,
+            getSpawnControlBackup = true,
             registerSpawnData = true,
             unregisterSpawnData = true,
             readyContext = true,
@@ -1241,12 +1542,49 @@ local function install_spawn_observer_hooks()
                         arg_limit = (param_types and #param_types or 0) + 2
                     end)
                     sdk.hook(method, function(args)
+                        if name == "setupControlCharacter"
+                            and state.load_phase_injection_armed
+                            and not state.load_phase_injection_done
+                            and not state.load_phase_injection_guard then
+                            local pending_control = args and hook_arg_to_managed(args[2]) or nil
+                            local pending_setting = args and hook_arg_to_managed(args[3]) or nil
+                            pcall(function()
+                                if pending_control and pending_control.add_ref then
+                                    pending_control = pending_control:add_ref()
+                                end
+                            end)
+                            pcall(function()
+                                if pending_setting and pending_setting.add_ref then
+                                    pending_setting = pending_setting:add_ref()
+                                end
+                            end)
+                            state.load_phase_injection_pending_control = pending_control
+                            state.load_phase_injection_pending_setting = pending_setting
+                            state.load_phase_injection_pre_lines = {}
+                            pcall(function()
+                                re9mp_append_spawn_control_identity_summary(
+                                    state.load_phase_injection_pre_lines,
+                                    "Control.real_pre_setup",
+                                    pending_control,
+                                    140
+                                )
+                            end)
+                        end
                         pcall(function() push_spawn_hook_event(label, args, arg_limit) end)
                         pcall(function() push_level_trace_event(label, args, "pre", nil, arg_limit) end)
                     end, function(retval)
                         pcall(function()
                             push_level_trace_event(label, nil, "post", retval, 0)
                         end)
+                        if name == "setupControlCharacter" then
+                            pcall(function()
+                                re9mp_maybe_run_load_phase_player_clone_injection(
+                                    state.load_phase_injection_pending_control,
+                                    state.load_phase_injection_pending_setting,
+                                    "post_setupControlCharacter"
+                                )
+                            end)
+                        end
                         return retval
                     end)
                     installed = installed + 1
@@ -2005,7 +2343,8 @@ local function append_iterable_summary(lines, label, obj, limit)
         return
     end
 
-    if count then
+    local numeric_index_ok = count and not type_name:find("HashSet", 1, true)
+    if numeric_index_ok then
         for i = 0, math.min((tonumber(count) or 0) - 1, (limit or 8) - 1) do
             pcall(function()
                 local item = nil
@@ -2017,7 +2356,7 @@ local function append_iterable_summary(lines, label, obj, limit)
                         item = obj:get_element(i)
                     end)
                 end
-                table.insert(lines, label .. "[" .. tostring(i) .. "]=" .. safe_string(item))
+                table.insert(lines, label .. "[" .. tostring(i) .. "]=" .. probe_summary_text(item))
                 for _, line in ipairs(object_field_summary(label .. "[" .. tostring(i) .. "]", item, 18)) do
                     table.insert(lines, line)
                 end
@@ -2033,7 +2372,7 @@ local function append_iterable_summary(lines, label, obj, limit)
             if not moved then break end
             direct_iterated = true
             local item = obj:call("get_Current")
-            table.insert(lines, label .. "[" .. tostring(i) .. "]=" .. safe_string(item))
+            table.insert(lines, label .. "[" .. tostring(i) .. "]=" .. probe_summary_text(item))
             for _, line in ipairs(object_field_summary(label .. "[" .. tostring(i) .. "]", item, 18)) do
                 table.insert(lines, line)
             end
@@ -2048,12 +2387,51 @@ local function append_iterable_summary(lines, label, obj, limit)
             local moved = iter:call("MoveNext")
             if not moved then break end
             local item = iter:call("get_Current")
-            table.insert(lines, label .. "[" .. tostring(i) .. "]=" .. safe_string(item))
+            table.insert(lines, label .. "[" .. tostring(i) .. "]=" .. probe_summary_text(item))
             for _, line in ipairs(object_field_summary(label .. "[" .. tostring(i) .. "]", item, 18)) do
                 table.insert(lines, line)
             end
         end
     end)
+end
+
+local function collect_iterable_values(obj, limit)
+    local values = {}
+    if not obj then return values end
+
+    pcall(function()
+        local iter = obj:call("GetEnumerator")
+        if not iter then return end
+        for _ = 1, (limit or 16) do
+            local moved = iter:call("MoveNext")
+            if not moved then break end
+            local item = iter:call("get_Current")
+            if item ~= nil then
+                pcall(function()
+                    if item.add_ref then item = item:add_ref() end
+                end)
+                table.insert(values, item)
+            end
+        end
+    end)
+    if #values > 0 then return values end
+
+    local type_name = trace_type_name(obj)
+    if type_name:find("Dictionary", 1, true) or type_name:find("HashSet", 1, true) then
+        return values
+    end
+
+    local count = trace_count(obj)
+    for i = 0, math.min(count - 1, (limit or 16) - 1) do
+        local item = trace_item(obj, i)
+        if item ~= nil then
+            pcall(function()
+                if item.add_ref then item = item:add_ref() end
+            end)
+            table.insert(values, item)
+        end
+    end
+    return values
 end
 
 local function append_safe_call_summary(lines, label, obj, call_names)
@@ -2062,8 +2440,125 @@ local function append_safe_call_summary(lines, label, obj, call_names)
         local ok, result = pcall(function()
             return obj:call(call_name)
         end)
-        table.insert(lines, label .. ":" .. call_name .. " -> " .. (ok and safe_string(result) or ("ERR " .. safe_string(result))))
+        local text = ok
+            and ((type(re9mp_probe_value_text) == "function" and re9mp_probe_value_text(result)) or safe_string(result))
+            or ("ERR " .. safe_string(result))
+        table.insert(lines, label .. ":" .. call_name .. " -> " .. text)
     end
+end
+
+function probe_summary_text(value)
+    if type(re9mp_probe_value_text) == "function" then
+        return re9mp_probe_value_text(value)
+    end
+    return safe_string(value)
+end
+
+function re9mp_probe_value_text(value)
+    if value == nil then return "" end
+    local path = path_from_managed_value(value)
+    if path then return path end
+
+    local type_name = trace_type_name(value)
+    local text = nil
+    pcall(function()
+        if value and value.call then
+            local result = value:call("ToString")
+            if result ~= nil then text = tostring(result) end
+        end
+    end)
+    if not text or text == "" then
+        pcall(function()
+            if value and value.call then
+                local result = value:call("get_Name")
+                if result ~= nil then text = tostring(result) end
+            end
+        end)
+    end
+    if not text or text == "" then text = safe_string(value) end
+    if type_name ~= "" and text ~= type_name then
+        return text .. " [" .. type_name .. "]"
+    end
+    return text
+end
+
+function re9mp_append_targeted_field_summary(lines, label, obj, markers, limit)
+    if not obj or not obj.get_type_definition then
+        table.insert(lines, label .. " targeted-fields skipped: nil or unmanaged")
+        return
+    end
+
+    local inserted = 0
+    pcall(function()
+        local td = obj:get_type_definition()
+        local depth = 0
+        local seen = {}
+        while td and depth < 8 do
+            local owner_type = td:get_full_name() or "?"
+            if seen[owner_type] then break end
+            seen[owner_type] = true
+
+            for _, field in ipairs(td:get_fields()) do
+                local name = field:get_name() or ""
+                local ftype = field:get_type()
+                local type_name = ftype and ftype:get_full_name() or "?"
+                local matched = false
+                for _, marker in ipairs(markers or {}) do
+                    if name:find(marker, 1, true) or type_name:find(marker, 1, true) then
+                        matched = true
+                        break
+                    end
+                end
+
+                if matched then
+                    local value = nil
+                    pcall(function() value = obj:get_field(name) end)
+                    table.insert(lines, label .. "." .. owner_type .. "." .. name
+                        .. " [" .. type_name .. "] = " .. re9mp_probe_value_text(value))
+                    inserted = inserted + 1
+                    if inserted >= (limit or 96) then return end
+                end
+            end
+
+            td = get_parent_type_definition(td)
+            depth = depth + 1
+        end
+    end)
+    table.insert(lines, label .. " targeted_fields=" .. tostring(inserted))
+end
+
+function re9mp_append_spawn_control_identity_summary(lines, label, control, limit)
+    table.insert(lines, label .. "=" .. safe_string(control) .. " type=" .. trace_type_name(control))
+    append_safe_call_summary(lines, label, control, {
+        "app.ICharacterSpawnControl.get_SpawnID()",
+        "app.ICharacterSpawnControl.get_ManagedContextID()",
+        "app.ICharacterSpawnControl.getAllManagedContextID()",
+        "get_HasPermittedSpawn",
+    })
+    local spawn_id = nil
+    local managed_ids = nil
+    pcall(function() spawn_id = control and control:call("app.ICharacterSpawnControl.get_SpawnID()") end)
+    pcall(function() managed_ids = control and control:call("app.ICharacterSpawnControl.getAllManagedContextID()") end)
+    append_iterable_summary(lines, label .. ".ManagedContextIDs", managed_ids, 12)
+    local char_mgr = sdk.get_managed_singleton("app.CharacterManager")
+    if char_mgr and spawn_id then
+        for _, call_name in ipairs({
+            "isUsedContext(app.ContextID)",
+            "getManagedContextID(app.ContextID)",
+            "getContextRef(app.ContextID)",
+            "getPlayerContextRef(app.ContextID)",
+        }) do
+            local ok, result = pcall(function()
+                return char_mgr:call(call_name, spawn_id)
+            end)
+            table.insert(lines, label .. ".CharacterManager:" .. call_name
+                .. "(" .. probe_summary_text(spawn_id) .. ") -> "
+                .. (ok and probe_summary_text(result) or ("ERR " .. safe_string(result))))
+        end
+    end
+    re9mp_append_targeted_field_summary(lines, label, control, {
+        "Context", "Managed", "Spawn", "Player", "Control", "Chara", "Character", "ID", "Guid",
+    }, limit or 120)
 end
 
 local function append_player_context_deep_summary(lines, label, player_context)
@@ -2844,6 +3339,148 @@ local function run_visual_component_probe()
     return true, state.visual_probe_status
 end
 
+function type_surface_for_type(type_name, method_limit, field_limit)
+    local row = {
+        type = safe_string(type_name),
+        found = false,
+        levels = {},
+    }
+    pcall(function()
+        local td = sdk.find_type_definition(type_name)
+        if not td then return end
+        row.found = true
+        local seen = {}
+        local depth = 0
+        while td and depth < 10 do
+            local level_name = td:get_full_name() or "?"
+            if seen[level_name] then break end
+            seen[level_name] = true
+            local level = {
+                type = level_name,
+                fields = {},
+                methods = {},
+            }
+            local f_count = 0
+            for _, field in ipairs(td:get_fields()) do
+                local ftype = nil
+                pcall(function() ftype = field:get_type() end)
+                table.insert(level.fields, {
+                    name = field:get_name() or "",
+                    type = ftype and ftype:get_full_name() or "",
+                    static = field:is_static() and true or false,
+                })
+                f_count = f_count + 1
+                if f_count >= (field_limit or 80) then break end
+            end
+            local m_count = 0
+            for _, method in ipairs(td:get_methods()) do
+                table.insert(level.methods, method_signature(method))
+                m_count = m_count + 1
+                if m_count >= (method_limit or 160) then break end
+            end
+            table.insert(row.levels, level)
+            td = get_parent_type_definition(td)
+            depth = depth + 1
+        end
+    end)
+    return row
+end
+
+function object_surface(label, obj, method_limit, field_limit)
+    local type_name = trace_type_name(obj)
+    local row = type_surface_for_type(type_name, method_limit or 160, field_limit or 80)
+    row.label = safe_string(label)
+    row.value = safe_string(obj)
+    return row
+end
+
+function run_mesh_registration_probe()
+    local refs = get_local_player_refs()
+    local report = {
+        time_ms = now_ms(),
+        scene = get_current_scene(),
+        local_player = refs.valid and true or false,
+        local_error = refs.error or "",
+        objects = {},
+        type_surfaces = {},
+        collection_counts = {},
+    }
+
+    if not refs.valid or not refs.go then
+        pcall(function() json.dump_file(MESH_REGISTRATION_PROBE_FILE, report) end)
+        return false, "mesh registration probe failed: " .. safe_string(refs.error)
+    end
+
+    local mesh_controller = find_component_by_type_name(refs.go, "app.PlayerMeshController")
+    local actor_mesh_controller = find_component_by_type_name(refs.go, "app.ActorPlayerMeshController")
+    local mesh_unit_dictionary = nil
+    local mesh_list = nil
+    local mesh_parts_dictionary = nil
+    local property_value_containers = nil
+    pcall(function() mesh_unit_dictionary = mesh_controller:get_field("<MeshUnitDictionary>k__BackingField") end)
+    pcall(function() mesh_list = mesh_controller:get_field("_MeshList") end)
+    pcall(function() mesh_parts_dictionary = mesh_controller:get_field("_MeshPartsDictionary") end)
+    pcall(function() property_value_containers = mesh_controller:get_field("_PropertyValueContainers") end)
+
+    local first_unit = nil
+    pcall(function()
+        local iter = mesh_unit_dictionary and mesh_unit_dictionary:call("GetEnumerator")
+        if not iter then return end
+        if iter:call("MoveNext") then
+            local current = iter:call("get_Current")
+            pcall(function() first_unit = current:call("get_Value") end)
+            if not first_unit then first_unit = current end
+        end
+    end)
+    local first_unit_go, first_unit_mesh, first_unit_mesh_controller, first_parent_mesh_controller = nil, nil, nil, nil
+    pcall(function() first_unit_go = first_unit:call("get_GameObject") end)
+    pcall(function() first_unit_mesh = first_unit:call("get_Mesh") end)
+    pcall(function() first_unit_mesh_controller = first_unit:call("get_MeshController") end)
+    pcall(function() first_parent_mesh_controller = first_unit:call("get_ParentMeshController") end)
+
+    report.collection_counts.mesh_unit_dictionary = trace_count(mesh_unit_dictionary)
+    report.collection_counts.mesh_list = trace_count(mesh_list)
+    report.collection_counts.mesh_parts_dictionary = trace_count(mesh_parts_dictionary)
+    report.collection_counts.property_value_containers = trace_count(property_value_containers)
+
+    table.insert(report.objects, object_surface("PlayerGameObject", refs.go, 220, 100))
+    table.insert(report.objects, object_surface("PlayerTransform", refs.xform, 220, 100))
+    table.insert(report.objects, object_surface("PlayerMeshController", mesh_controller, 260, 120))
+    table.insert(report.objects, object_surface("ActorPlayerMeshController", actor_mesh_controller, 220, 100))
+    table.insert(report.objects, object_surface("MeshUnitDictionary", mesh_unit_dictionary, 180, 80))
+    table.insert(report.objects, object_surface("MeshList", mesh_list, 180, 80))
+    table.insert(report.objects, object_surface("MeshPartsDictionary", mesh_parts_dictionary, 180, 80))
+    table.insert(report.objects, object_surface("PropertyValueContainers", property_value_containers, 180, 80))
+    table.insert(report.objects, object_surface("FirstMeshUnit", first_unit, 220, 100))
+    table.insert(report.objects, object_surface("FirstMeshUnitGameObject", first_unit_go, 220, 100))
+    table.insert(report.objects, object_surface("FirstMeshUnitMesh", first_unit_mesh, 260, 120))
+    table.insert(report.objects, object_surface("FirstMeshUnitMeshController", first_unit_mesh_controller, 260, 120))
+    table.insert(report.objects, object_surface("FirstMeshUnitParentMeshController", first_parent_mesh_controller, 260, 120))
+
+    for _, type_name in ipairs({
+        "app.MeshController",
+        "app.CharacterMeshControllerBase",
+        "app.PlayerMeshController",
+        "app.ActorPlayerMeshController",
+        "app.MeshUnit",
+        "app.MeshController.PropertyKey",
+        "app.MeshController.PropertyMetadata",
+        "app.MeshController.PropertyValueContainer",
+        "via.render.Mesh",
+        "via.GameObject",
+        "via.Transform",
+        "via.Component",
+        "via.Folder",
+        "System.Collections.Generic.Dictionary`2<System.UInt32,app.MeshUnit>",
+        "System.Collections.Generic.LinkedList`1<via.render.Mesh>",
+    }) do
+        table.insert(report.type_surfaces, type_surface_for_type(type_name, 220, 100))
+    end
+
+    pcall(function() json.dump_file(MESH_REGISTRATION_PROBE_FILE, report) end)
+    return true, "mesh registration probe dumped objects=" .. tostring(#report.objects)
+end
+
 local function run_request_spawn_empty_context()
     local char_mgr = sdk.get_managed_singleton("app.CharacterManager")
     if not char_mgr then
@@ -2931,7 +3568,7 @@ local function create_new_context_id()
         end
     end
 
-    return ctx, lines
+    return ctx, lines, guid
 end
 
 local function run_context_create_probe()
@@ -3842,6 +4479,590 @@ local function run_player_load_order_grace_probe()
     return context_ref ~= nil or registered, state.character_spawn_status
 end
 
+function re9mp_run_trace_order_controller_spawn_probe()
+    local char_mgr = sdk.get_managed_singleton("app.CharacterManager")
+    if not char_mgr then
+        state.character_spawn_status = "trace-order spawn failed: CharacterManager not found"
+        return false, state.character_spawn_status
+    end
+
+    local ctx, lines = create_new_context_id()
+    local kind_grace = get_static_field_value("app.CharacterKindID", {"cp_A100"})
+    if not ctx or not kind_grace then
+        state.character_spawn_status = "trace-order spawn failed: missing ContextID/kind | " .. table.concat(lines, " | ")
+        return false, state.character_spawn_status
+    end
+    pcall(function() ctx = ctx:add_ref() end)
+    state.last_spawn_context = ctx
+    pcall(function() state.last_spawn_context_text = safe_string(ctx:call("ToString")) end)
+
+    local _, control, default_setting, bundle_err = get_spawn_control_bundle(char_mgr, kind_grace, lines)
+    if not control or not default_setting then
+        state.character_spawn_status = "trace-order spawn failed: " .. bundle_err .. " | " .. table.concat(lines, " | ")
+        state.puppet_status = state.character_spawn_status
+        return false, state.character_spawn_status
+    end
+
+    local setting = make_controller_create_setting(default_setting, kind_grace, lines)
+    local old_spawn_context = nil
+    local old_request_end = nil
+    local old_permitted = nil
+    local old_init_suspended = nil
+    pcall(function() old_spawn_context = control:get_field("_SpawnContextID") end)
+    pcall(function() old_request_end = control:get_field("IsSpawnRequestEnd") end)
+    pcall(function() old_permitted = control:get_field("<HasPermittedSpawn>k__BackingField") end)
+    pcall(function() old_init_suspended = control:get_field("_InitStateSuspended") end)
+    table.insert(lines, "control old _SpawnContextID=" .. safe_string(old_spawn_context)
+        .. " IsSpawnRequestEnd=" .. safe_string(old_request_end)
+        .. " HasPermitted=" .. safe_string(old_permitted)
+        .. " InitSuspended=" .. safe_string(old_init_suspended))
+
+    set_named_field_for_probe(control, "_SpawnContextID", ctx, "Control", lines)
+    set_named_field_for_probe(control, "IsSpawnRequestEnd", false, "Control", lines)
+    set_named_field_for_probe(control, "<HasPermittedSpawn>k__BackingField", false, "Control", lines)
+    set_named_field_for_probe(control, "_InitStateSuspended", false, "Control", lines)
+    schedule_controller_restore(control, old_spawn_context, old_request_end, old_permitted)
+
+    for _, call_name in ipairs({"registerSpawnGroup(app.ICharacterSpawnControl)", "registerSpawnGroup"}) do
+        local ok_group, err_group = pcall(function()
+            char_mgr:call(call_name, control)
+        end)
+        table.insert(lines, call_name .. "(trace-order control) -> " .. (ok_group and "ok" or ("ERR " .. safe_string(err_group))))
+        if ok_group then break end
+    end
+
+    local context_ref = nil
+    local ok_setup, err_setup = pcall(function()
+        control:call("setupControlCharacter(app.LevelPlayerCreateController.CreateSetting)", setting)
+    end)
+    table.insert(lines, "Control:setupControlCharacter(trace-order setting) -> " .. (ok_setup and "ok" or ("ERR " .. safe_string(err_setup))))
+
+    for _, call_name in ipairs({"getContextRef(app.ContextID)", "getContextRef"}) do
+        local ok_ref, result = pcall(function()
+            return char_mgr:call(call_name, ctx)
+        end)
+        table.insert(lines, call_name .. "(trace-order after setup) -> " .. (ok_ref and safe_string(result) or ("ERR " .. safe_string(result))))
+        if ok_ref and result and not context_ref then
+            context_ref = result
+            pcall(function() context_ref = context_ref:add_ref() end)
+        end
+    end
+
+    if context_ref then
+        local ok_common, err_common = pcall(function()
+            control:call("setupCommonMessageKind(app.LevelPlayerCreateController.CreateSetting, app.CharacterContext)", setting, context_ref)
+        end)
+        table.insert(lines, "Control:setupCommonMessageKind(trace-order context) -> " .. (ok_common and "ok" or ("ERR " .. safe_string(err_common))))
+    else
+        table.insert(lines, "Control:setupCommonMessageKind skipped: no context after setup")
+    end
+
+    local ok_create, err_create = pcall(function()
+        control:call("createControlCharacter()")
+    end)
+    table.insert(lines, "Control:createControlCharacter(trace-order) -> " .. (ok_create and "ok" or ("ERR " .. safe_string(err_create))))
+
+    if not context_ref then
+        for _, call_name in ipairs({"getContextRef(app.ContextID)", "getContextRef"}) do
+            local ok_ref, result = pcall(function()
+                return char_mgr:call(call_name, ctx)
+            end)
+            table.insert(lines, call_name .. "(trace-order after create) -> " .. (ok_ref and safe_string(result) or ("ERR " .. safe_string(result))))
+            if ok_ref and result and not context_ref then
+                context_ref = result
+                pcall(function() context_ref = context_ref:add_ref() end)
+            end
+        end
+    end
+
+    local has_go = false
+    if context_ref then
+        pcall(function()
+            local go = context_ref:call("get_GameObject")
+            table.insert(lines, "Trace-order context get_GameObject -> " .. safe_string(go))
+            has_go = go ~= nil
+            if go then
+                state.puppet_go = go:add_ref()
+                state.puppet_xform = go:call("get_Transform")
+                pcall(function() state.puppet_xform = state.puppet_xform:add_ref() end)
+            end
+        end)
+        pcall(function()
+            local updater = context_ref:call("get_Updater")
+            table.insert(lines, "Trace-order context get_Updater -> " .. safe_string(updater))
+        end)
+    end
+
+    pcall(function()
+        json.dump_file(DATA_PREFIX .. "trace_order_spawn_probe.json", {
+            time_ms = now_ms(),
+            scene = get_current_scene(),
+            ok = context_ref ~= nil,
+            has_game_object = has_go,
+            context = state.last_spawn_context_text,
+            lines = lines,
+        })
+    end)
+
+    state.character_spawn_status = "trace-order spawn " .. (has_go and "has gameobject" or (context_ref and "has context" or "failed"))
+        .. " for " .. safe_string(state.last_spawn_context_text)
+    state.puppet_status = has_go and "Trace-order Grace context has GameObject" or state.character_spawn_status
+    return context_ref ~= nil or ok_setup or ok_create, state.character_spawn_status
+end
+
+function re9mp_dump_load_phase_injection_probe(reason)
+    local report = {
+        time_ms = now_ms(),
+        scene = get_current_scene(),
+        reason = safe_string(reason or "dump"),
+        injection = {
+            armed = state.load_phase_injection_armed and true or false,
+            done = state.load_phase_injection_done and true or false,
+            mode = safe_string(state.load_phase_injection_mode),
+            status = safe_string(state.load_phase_injection_status),
+            context = safe_string(state.load_phase_injection_context_text),
+            lines = state.load_phase_injection_lines or {},
+        },
+        character_manager = {},
+        injected_context = {},
+        local_player_refs = {},
+    }
+
+    local char_mgr = sdk.get_managed_singleton("app.CharacterManager")
+    report.character_manager.ref = safe_string(char_mgr)
+    if char_mgr then
+        local player_list = nil
+        local pool_list = nil
+        local spawn_data_db = nil
+        local context_db = nil
+        pcall(function() player_list = char_mgr:get_field("<PlayerContextList>k__BackingField") end)
+        pcall(function() pool_list = char_mgr:get_field("<CharacterPool>k__BackingField") end)
+        pcall(function() spawn_data_db = char_mgr:get_field("<CharacterSpawnDataDB>k__BackingField") end)
+        pcall(function() context_db = char_mgr:get_field("<CharacterContextDB>k__BackingField") end)
+        report.character_manager.counts = {
+            player_contexts = trace_count(player_list),
+            character_pool = trace_count(pool_list),
+            spawn_data_db = trace_count(spawn_data_db),
+            context_db = trace_count(context_db),
+        }
+        report.character_manager.player_contexts = {}
+        report.character_manager.pool_a100 = {}
+        for i = 0, math.min((report.character_manager.counts.player_contexts or 0) - 1, 7) do
+            table.insert(report.character_manager.player_contexts, trace_context_summary(trace_item(player_list, i), i))
+        end
+        for i = 0, math.min((report.character_manager.counts.character_pool or 0) - 1, 63) do
+            local row = trace_pool_summary(trace_item(pool_list, i), i)
+            if row.updater_type == "app.Cp_A100Updater" or row.updater_type == "app.PlayerUpdaterBase" then
+                table.insert(report.character_manager.pool_a100, row)
+            end
+        end
+
+        local ctx = state.load_phase_injection_context
+        if ctx then
+            local context_ref = nil
+            for _, call_name in ipairs({"getContextRef(app.ContextID)", "getContextRef"}) do
+                local ok_ref, result = pcall(function()
+                    return char_mgr:call(call_name, ctx)
+                end)
+                report.injected_context[call_name] = ok_ref and safe_string(result) or ("ERR " .. safe_string(result))
+                if ok_ref and result and not context_ref then
+                    context_ref = result
+                end
+            end
+            if context_ref then
+                report.injected_context.summary = trace_context_summary(context_ref, -1)
+                local go = nil
+                local xform = nil
+                pcall(function() go = context_ref:call("get_GameObject") end)
+                pcall(function() xform = context_ref:call("get_Transform") end)
+                report.injected_context.game_object = safe_string(go)
+                report.injected_context.game_object_name = safe_string(trace_call(go, "get_Name"))
+                report.injected_context.transform = safe_string(xform)
+                report.injected_context.position = read_position(xform)
+                report.injected_context.rotation = read_rotation(xform)
+                report.injected_context.updater = safe_string(trace_call(context_ref, "get_Updater"))
+                report.injected_context.updater_type = trace_type_name(trace_call(context_ref, "get_Updater"))
+                if go then
+                    pcall(function() state.puppet_go = go:add_ref() end)
+                    pcall(function()
+                        state.puppet_xform = go:call("get_Transform")
+                        if state.puppet_xform and state.puppet_xform.add_ref then
+                            state.puppet_xform = state.puppet_xform:add_ref()
+                        end
+                    end)
+                end
+            end
+        end
+    end
+
+    local refs = get_local_player_refs()
+    if refs and refs.valid then
+        report.local_player_refs = {
+            player = safe_string(refs.player),
+            game_object = safe_string(refs.go),
+            game_object_name = safe_string(trace_call(refs.go, "get_Name")),
+            transform = safe_string(refs.xform),
+            position = read_position(refs.xform),
+            rotation = read_rotation(refs.xform),
+            updater = safe_string(trace_call(refs.player, "get_Updater")),
+            updater_type = trace_type_name(trace_call(refs.player, "get_Updater")),
+        }
+    end
+
+    pcall(function() json.dump_file(DATA_PREFIX .. "load_phase_injection_probe.json", report) end)
+    return true, "load-phase injection probe dumped: " .. safe_string(state.load_phase_injection_status)
+end
+
+local function find_pending_player_context(char_mgr, lines)
+    if not char_mgr then return nil end
+    local player_list = nil
+    pcall(function() player_list = char_mgr:get_field("<PlayerContextList>k__BackingField") end)
+    local count = trace_count(player_list)
+    table.insert(lines, "pending PlayerContextList count=" .. tostring(count))
+    for i = count - 1, 0, -1 do
+        local ctx = trace_item(player_list, i)
+        if ctx then
+            local go = nil
+            local updater = nil
+            local active = nil
+            pcall(function() go = ctx:call("get_GameObject") end)
+            pcall(function() updater = ctx:call("get_Updater") end)
+            pcall(function() active = ctx:get_field("<Active>k__BackingField") end)
+            table.insert(lines, "pending PlayerContext[" .. tostring(i) .. "] active=" .. safe_string(active)
+                .. " go=" .. safe_string(go) .. " updater=" .. safe_string(updater))
+            if not go and not updater then
+                pcall(function() ctx = ctx:add_ref() end)
+                return ctx
+            end
+        end
+    end
+    return nil
+end
+
+function re9mp_maybe_run_load_phase_player_clone_injection(control, source_setting, trigger)
+    if not state.load_phase_injection_armed
+        or state.load_phase_injection_done
+        or state.load_phase_injection_guard then
+        return false, "load-phase injection not armed"
+    end
+
+    state.load_phase_injection_guard = true
+    state.load_phase_injection_done = true
+    state.load_phase_injection_armed = false
+    state.load_phase_injection_pending_control = nil
+    state.load_phase_injection_pending_setting = nil
+
+    local lines = {
+        "trigger=" .. safe_string(trigger),
+        "scene=" .. safe_string(get_current_scene()),
+        "mode=" .. safe_string(state.load_phase_injection_mode),
+    }
+    for _, line in ipairs(state.load_phase_injection_pre_lines or {}) do
+        table.insert(lines, line)
+    end
+    state.load_phase_injection_lines = lines
+
+    local ok_run, err_run = pcall(function()
+        local char_mgr = sdk.get_managed_singleton("app.CharacterManager")
+        if not char_mgr then
+            table.insert(lines, "CharacterManager not found")
+            state.load_phase_injection_status = "failed: CharacterManager not found"
+            return
+        end
+        if not control then
+            table.insert(lines, "LevelPlayerCreateController not captured")
+            state.load_phase_injection_status = "failed: controller not captured"
+            return
+        end
+
+        local kind_grace = get_static_field_value("app.CharacterKindID", {"cp_A100"})
+        local ctx, ctx_lines, raw_guid = create_new_context_id()
+        for _, line in ipairs(ctx_lines or {}) do table.insert(lines, line) end
+        if not kind_grace or not ctx then
+            state.load_phase_injection_status = "failed: missing cp_A100 kind or ContextID"
+            return
+        end
+
+        pcall(function() ctx = ctx:add_ref() end)
+        state.load_phase_injection_context = ctx
+        state.last_spawn_context = ctx
+        pcall(function() state.load_phase_injection_context_text = safe_string(ctx:call("ToString")) end)
+        state.last_spawn_context_text = state.load_phase_injection_context_text
+
+        local mode = safe_string(state.load_phase_injection_mode)
+        re9mp_append_spawn_control_identity_summary(lines, "Control.real_post_setup", control, 140)
+
+        local setting_source = source_setting
+        if not setting_source then
+            local _, _, default_setting, bundle_err = get_spawn_control_bundle(char_mgr, kind_grace, lines)
+            table.insert(lines, "fallback bundle -> " .. safe_string(bundle_err))
+            setting_source = default_setting
+        end
+        if not setting_source then
+            state.load_phase_injection_status = "failed: source CreateSetting not captured"
+            return
+        end
+        append_create_setting_summary(lines, "CreateSetting.real_arg", setting_source)
+
+        if mode == "diagnose_only" then
+            state.load_phase_injection_status = "diagnosed real setup control"
+            state.character_spawn_status = "load-phase injection " .. state.load_phase_injection_status
+            state.puppet_status = state.character_spawn_status
+            return
+        end
+
+        local setting = make_controller_create_setting(setting_source, kind_grace, lines)
+        append_create_setting_summary(lines, "CreateSetting.clone_initial", setting)
+        set_fields_by_type_or_name(setting, "app.ContextID", {"SpawnContextID", "ContextID"}, ctx, "CreateSetting", lines)
+        set_named_field_for_probe(setting, "_ControlCharaId", "cp_A100", "CreateSetting", lines)
+        set_named_field_for_probe(setting, "_ControlCharaIdCache", kind_grace, "CreateSetting", lines)
+
+        local old_spawn_context = nil
+        local old_game_object_guid = nil
+        local managed_context_ids = nil
+        local old_managed_context_ids = {}
+        local old_request_end = nil
+        local old_permitted = nil
+        local old_init_suspended = nil
+        pcall(function() old_spawn_context = control:get_field("_SpawnContextID") end)
+        pcall(function() old_game_object_guid = control:get_field("_GameObjectGuid") end)
+        pcall(function() managed_context_ids = control:call("app.ICharacterSpawnControl.getAllManagedContextID()") end)
+        old_managed_context_ids = collect_iterable_values(managed_context_ids, 16)
+        pcall(function() old_request_end = control:get_field("IsSpawnRequestEnd") end)
+        pcall(function() old_permitted = control:get_field("<HasPermittedSpawn>k__BackingField") end)
+        pcall(function() old_init_suspended = control:get_field("_InitStateSuspended") end)
+        table.insert(lines, "control old _SpawnContextID=" .. safe_string(old_spawn_context)
+            .. " _GameObjectGuid=" .. safe_string(old_game_object_guid)
+            .. " managed_ids=" .. tostring(#old_managed_context_ids)
+            .. " IsSpawnRequestEnd=" .. safe_string(old_request_end)
+            .. " HasPermitted=" .. safe_string(old_permitted)
+            .. " InitSuspended=" .. safe_string(old_init_suspended))
+        append_iterable_summary(lines, "Control.managed_ids.before_mutation", managed_context_ids, 16)
+
+        if raw_guid then
+            set_named_field_for_probe(control, "_GameObjectGuid", raw_guid, "Control", lines)
+        else
+            table.insert(lines, "Control set _GameObjectGuid skipped: raw guid nil")
+        end
+        set_named_field_for_probe(control, "_SpawnContextID", ctx, "Control", lines)
+        set_named_field_for_probe(control, "IsSpawnRequestEnd", false, "Control", lines)
+        set_named_field_for_probe(control, "<HasPermittedSpawn>k__BackingField", false, "Control", lines)
+        set_named_field_for_probe(control, "_InitStateSuspended", false, "Control", lines)
+        if managed_context_ids and #old_managed_context_ids > 0 then
+            local ok_clear, err_clear = false, nil
+            for _, call_name in ipairs({"Clear()", "Clear"}) do
+                ok_clear, err_clear = pcall(function() managed_context_ids:call(call_name) end)
+                table.insert(lines, "Control managed_ids " .. call_name .. " -> "
+                    .. (ok_clear and "ok" or ("ERR " .. safe_string(err_clear))))
+                if ok_clear then break end
+            end
+            local ok_add, err_add = false, nil
+            for _, call_name in ipairs({"Add(app.ContextID)", "Add"}) do
+                ok_add, err_add = pcall(function() managed_context_ids:call(call_name, ctx) end)
+                table.insert(lines, "Control managed_ids " .. call_name .. "(new ctx) -> "
+                    .. (ok_add and "ok" or ("ERR " .. safe_string(err_add))))
+                if ok_add then break end
+            end
+            append_iterable_summary(lines, "Control.managed_ids.after_mutation", managed_context_ids, 16)
+        else
+            table.insert(lines, "Control managed_ids mutation skipped: set nil or old ids empty")
+        end
+        re9mp_append_spawn_control_identity_summary(lines, "Control.after_set", control, 140)
+
+        for _, call_name in ipairs({"registerSpawnGroup(app.ICharacterSpawnControl)", "registerSpawnGroup"}) do
+            local ok_group, err_group = pcall(function()
+                char_mgr:call(call_name, control)
+            end)
+            table.insert(lines, call_name .. "(load-phase control) -> " .. (ok_group and "ok" or ("ERR " .. safe_string(err_group))))
+            if ok_group then break end
+        end
+
+        local ok_setup, err_setup = pcall(function()
+            control:call("setupControlCharacter(app.LevelPlayerCreateController.CreateSetting)", setting)
+        end)
+        table.insert(lines, "Control:setupControlCharacter(load-phase clone) -> " .. (ok_setup and "ok" or ("ERR " .. safe_string(err_setup))))
+        re9mp_append_spawn_control_identity_summary(lines, "Control.after_setup", control, 140)
+
+        local context_ref = nil
+        for _, call_name in ipairs({"getContextRef(app.ContextID)", "getContextRef"}) do
+            local ok_ref, result = pcall(function()
+                return char_mgr:call(call_name, ctx)
+            end)
+            table.insert(lines, call_name .. "(load-phase after setup) -> " .. (ok_ref and safe_string(result) or ("ERR " .. safe_string(result))))
+            if ok_ref and result and not context_ref then
+                context_ref = result
+                pcall(function() context_ref = context_ref:add_ref() end)
+            end
+        end
+        if not context_ref then
+            context_ref = find_pending_player_context(char_mgr, lines)
+            table.insert(lines, "pending PlayerContext fallback -> " .. safe_string(context_ref))
+        end
+
+        if context_ref and mode ~= "setup_only" then
+            local ok_common, err_common = pcall(function()
+                control:call("setupCommonMessageKind(app.LevelPlayerCreateController.CreateSetting, app.CharacterContext)", setting, context_ref)
+            end)
+            table.insert(lines, "Control:setupCommonMessageKind(load-phase clone) -> " .. (ok_common and "ok" or ("ERR " .. safe_string(err_common))))
+        elseif not context_ref then
+            table.insert(lines, "Control:setupCommonMessageKind skipped: no context after setup")
+        end
+
+        if mode == "setup_create" or mode == "create" or mode == "full" then
+            local ok_create, err_create = pcall(function()
+                control:call("createControlCharacter()")
+            end)
+            table.insert(lines, "Control:createControlCharacter(load-phase clone) -> " .. (ok_create and "ok" or ("ERR " .. safe_string(err_create))))
+            re9mp_append_spawn_control_identity_summary(lines, "Control.after_create", control, 140)
+        else
+            table.insert(lines, "Control:createControlCharacter skipped for mode=" .. mode)
+        end
+
+        for _, call_name in ipairs({"getContextRef(app.ContextID)", "getContextRef"}) do
+            local ok_ref, result = pcall(function()
+                return char_mgr:call(call_name, ctx)
+            end)
+            table.insert(lines, call_name .. "(load-phase after create) -> " .. (ok_ref and safe_string(result) or ("ERR " .. safe_string(result))))
+            if ok_ref and result and not context_ref then
+                context_ref = result
+                pcall(function() context_ref = context_ref:add_ref() end)
+            end
+        end
+
+        if context_ref then
+            pcall(function()
+                table.insert(lines, "Injected context get_GameObject -> " .. safe_string(context_ref:call("get_GameObject")))
+            end)
+            pcall(function()
+                table.insert(lines, "Injected context get_Updater -> " .. safe_string(context_ref:call("get_Updater")))
+            end)
+        end
+
+        pcall(function() control:set_field("_SpawnContextID", old_spawn_context) end)
+        if old_game_object_guid ~= nil then pcall(function() control:set_field("_GameObjectGuid", old_game_object_guid) end) end
+        if managed_context_ids and #old_managed_context_ids > 0 then
+            for _, call_name in ipairs({"Clear()", "Clear"}) do
+                local ok_clear = pcall(function() managed_context_ids:call(call_name) end)
+                if ok_clear then break end
+            end
+            for _, old_id in ipairs(old_managed_context_ids) do
+                for _, call_name in ipairs({"Add(app.ContextID)", "Add"}) do
+                    local ok_add = pcall(function() managed_context_ids:call(call_name, old_id) end)
+                    if ok_add then break end
+                end
+            end
+            append_iterable_summary(lines, "Control.managed_ids.after_restore", managed_context_ids, 16)
+        end
+        if old_request_end ~= nil then pcall(function() control:set_field("IsSpawnRequestEnd", old_request_end) end) end
+        if old_permitted ~= nil then pcall(function() control:set_field("<HasPermittedSpawn>k__BackingField", old_permitted) end) end
+        if old_init_suspended ~= nil then pcall(function() control:set_field("_InitStateSuspended", old_init_suspended) end) end
+
+        state.load_phase_injection_status = context_ref
+            and ("triggered; context=" .. safe_string(state.load_phase_injection_context_text))
+            or ("triggered; no context=" .. safe_string(state.load_phase_injection_context_text))
+        state.character_spawn_status = "load-phase injection " .. state.load_phase_injection_status
+        state.puppet_status = state.character_spawn_status
+    end)
+
+    if not ok_run then
+        table.insert(lines, "ERROR " .. safe_string(err_run))
+        state.load_phase_injection_status = "error: " .. safe_string(err_run)
+        state.character_spawn_status = state.load_phase_injection_status
+        state.puppet_status = state.load_phase_injection_status
+    end
+
+    state.load_phase_injection_guard = false
+    state.load_phase_injection_followup_until = now() + 8.0
+    state.load_phase_injection_next_dump = 0
+    re9mp_dump_load_phase_injection_probe("after injection")
+    push_level_trace_note("load_phase_injection " .. safe_string(state.load_phase_injection_status))
+    return ok_run, state.load_phase_injection_status
+end
+
+function re9mp_arm_load_phase_player_clone_injection(mode)
+    local requested = safe_string(mode or "")
+    if requested == "" then requested = "setup_create" end
+    if requested ~= "diagnose_only"
+        and requested ~= "setup_only" and requested ~= "setup_common"
+        and requested ~= "setup_create" and requested ~= "create"
+        and requested ~= "full" then
+        return false, "mode must be diagnose_only, setup_only, setup_common, setup_create, create, or full"
+    end
+
+    clear_puppet_refs("despawned")
+    state.remote_samples = {}
+    state.remote_last_seq = nil
+    state.remote_prev_seq = nil
+    cfg.local_dummy = false
+    cfg.auto_spawn_puppet = false
+    cfg.level_trace_enabled = true
+    cfg.pool_trace_enabled = true
+    cfg.bind_trace_enabled = true
+    cfg.controller_trace_enabled = true
+    save_cfg()
+
+    state.trace_mode = "load_phase_injection"
+    state.load_phase_injection_armed = true
+    state.load_phase_injection_done = false
+    state.load_phase_injection_guard = false
+    state.load_phase_injection_mode = requested
+    state.load_phase_injection_status = "armed mode=" .. requested
+    state.load_phase_injection_lines = {"armed at scene=" .. safe_string(get_current_scene())}
+    state.load_phase_injection_context = nil
+    state.load_phase_injection_context_text = ""
+    state.load_phase_injection_pending_control = nil
+    state.load_phase_injection_pending_setting = nil
+    state.load_phase_injection_pre_lines = {}
+    state.load_phase_injection_followup_until = 0
+    state.load_phase_injection_next_dump = 0
+
+    state.level_trace_enabled = true
+    state.pool_trace_enabled = true
+    state.bind_trace_enabled = true
+    state.spawn_hook_enabled = true
+    state.spawn_hook_events = {}
+    state.spawn_hook_dirty = true
+    state.spawn_hook_status = "cleared for load-phase injection"
+    reset_level_trace("load-phase injection " .. requested)
+    reset_pool_trace("load-phase injection " .. requested)
+    reset_bind_trace("load-phase injection " .. requested)
+    push_pool_trace_event("load-phase injection armed", true)
+    install_spawn_observer_hooks()
+    install_bind_trace_hooks()
+    re9mp_dump_load_phase_injection_probe("armed")
+    dump_spawn_hook_log(true)
+    dump_level_trace(true)
+    dump_pool_trace(true)
+    dump_bind_trace(true)
+    return true, "load-phase player clone injection armed mode=" .. requested .. "; go Main Menu -> load gameplay"
+end
+
+function re9mp_cancel_load_phase_player_clone_injection()
+    state.load_phase_injection_armed = false
+    state.load_phase_injection_guard = false
+    state.load_phase_injection_pending_control = nil
+    state.load_phase_injection_pending_setting = nil
+    state.load_phase_injection_pre_lines = {}
+    state.load_phase_injection_status = "cancelled"
+    re9mp_dump_load_phase_injection_probe("cancelled")
+    return true, "load-phase injection cancelled"
+end
+
+function re9mp_poll_load_phase_player_clone_injection()
+    if not state.load_phase_injection_done then return end
+    if (state.load_phase_injection_followup_until or 0) <= 0 then return end
+    local t = now()
+    if t > state.load_phase_injection_followup_until then
+        state.load_phase_injection_followup_until = 0
+        re9mp_dump_load_phase_injection_probe("followup final")
+        return
+    end
+    if t >= (state.load_phase_injection_next_dump or 0) then
+        state.load_phase_injection_next_dump = t + 0.5
+        re9mp_dump_load_phase_injection_probe("followup")
+    end
+end
+
 local function disable_puppet_components(go)
     pcall(function()
         local components = go:call("get_Components")
@@ -3959,6 +5180,17 @@ local function first_scene_transform()
         if transforms then xform = transforms[0] end
     end)
     return xform
+end
+
+function re9mp_describe_transform(xform)
+    local go = nil
+    pcall(function() go = xform and xform:call("get_GameObject") end)
+    return {
+        transform = safe_string(xform),
+        game_object = safe_string(go),
+        name = safe_string(trace_call(go, "get_Name")),
+        position = read_position(xform),
+    }
 end
 
 local function component_summary_for_go(go, limit)
@@ -4154,6 +5386,1389 @@ local function try_spawn_prefab_candidate(refs)
     return false, errors[1]
 end
 
+function hold_managed_ref(obj)
+    local held = obj
+    pcall(function()
+        if obj and obj.add_ref then held = obj:add_ref() end
+    end)
+    return held
+end
+
+function hide_game_object(go)
+    if not go then return end
+    pcall(function() go:call("set_Draw", false) end)
+    pcall(function() go:call("set_DrawSelf", false) end)
+    pcall(function() go:call("set_UpdateSelf", false) end)
+    pcall(function() go:call("set_Active", false) end)
+end
+
+function clear_puppet_refs(status)
+    hide_game_object(state.puppet_go)
+    hide_game_object(state.puppet_anchor_go)
+    for _, unit in ipairs(state.puppet_visual_units or {}) do
+        if unit.registration_controller and unit.registration_key ~= nil then
+            pcall(function()
+                unit.registration_controller:call("unregisterMeshUnit(System.UInt32)", unit.registration_key)
+            end)
+            pcall(function()
+                unit.registration_controller:call("unregisterMeshUnit", unit.registration_key)
+            end)
+        end
+        hide_game_object(unit.go)
+    end
+    state.puppet_go = nil
+    state.puppet_xform = nil
+    state.puppet_anchor_go = nil
+    state.puppet_root_parented = false
+    state.puppet_local_hierarchy = false
+    state.puppet_independent_root = false
+    state.puppet_visual_units = {}
+    if status then state.puppet_status = status end
+end
+
+function read_scale(xform)
+    local scale = nil
+    pcall(function() scale = xform and xform:call("get_Scale") end)
+    if not scale then return { x = 1, y = 1, z = 1 } end
+    return {
+        x = float_field(scale, "x", 1),
+        y = float_field(scale, "y", 1),
+        z = float_field(scale, "z", 1),
+    }
+end
+
+function set_transform_pose(xform, pos, rot, scale)
+    if not xform then return end
+    if pos then
+        local v = make_vec3(pos.x or 0, pos.y or 0, pos.z or 0)
+        if v then pcall(function() xform:call("set_Position", v) end) end
+    end
+    if rot then
+        local q = make_quat(rot.x or 0, rot.y or 0, rot.z or 0, rot.w or 1)
+        if q then pcall(function() xform:call("set_Rotation", q) end) end
+    end
+    if scale then
+        local s = make_vec3(scale.x or 1, scale.y or 1, scale.z or 1)
+        if s then pcall(function() xform:call("set_Scale", s) end) end
+    end
+end
+
+function set_transform_local_pose(xform, pos, rot, scale)
+    if not xform then return end
+    if pos then
+        local v = make_vec3(pos.x or 0, pos.y or 0, pos.z or 0)
+        if v then pcall(function() xform:call("set_LocalPosition", v) end) end
+    end
+    if rot then
+        local q = make_quat(rot.x or 0, rot.y or 0, rot.z or 0, rot.w or 1)
+        if q then pcall(function() xform:call("set_LocalRotation", q) end) end
+    end
+    if scale then
+        local s = make_vec3(scale.x or 1, scale.y or 1, scale.z or 1)
+        if s then pcall(function() xform:call("set_LocalScale", s) end) end
+    end
+end
+
+function parent_transform_keep_world(child_xform, parent_xform)
+    local info = {
+        attempted = child_xform ~= nil and parent_xform ~= nil,
+        ok = false,
+        method = "",
+        error = "",
+    }
+    if not info.attempted then
+        info.error = "missing child or parent transform"
+        return info
+    end
+
+    local ok, err = pcall(function()
+        child_xform:call("setParent", parent_xform, true)
+    end)
+    if ok then
+        info.ok = true
+        info.method = "setParent(via.Transform,true)"
+        return info
+    end
+    info.error = safe_string(err)
+
+    ok, err = pcall(function()
+        child_xform:call("set_Parent", parent_xform)
+    end)
+    if ok then
+        info.ok = true
+        info.method = "set_Parent(via.Transform)"
+        return info
+    end
+    info.error = info.error .. " | set_Parent: " .. safe_string(err)
+
+    ok, err = pcall(function()
+        child_xform:call("setParentDirect", parent_xform)
+    end)
+    if ok then
+        info.ok = true
+        info.method = "setParentDirect(via.Transform)"
+        return info
+    end
+    info.error = info.error .. " | setParentDirect: " .. safe_string(err)
+    return info
+end
+
+function detach_transform_keep_world(go, xform, folder, pos, rot, scale)
+    local info = {
+        attempted = xform ~= nil,
+        ok = false,
+        method = "",
+        error = "",
+        before_position = read_position(xform),
+        before_local_position = read_local_position(xform),
+    }
+    if not info.attempted then
+        info.error = "missing transform"
+        return info
+    end
+
+    local ok, err = pcall(function()
+        xform:call("setParent", nil, true)
+    end)
+    if ok then
+        info.ok = true
+        info.method = "setParent(nil,true)"
+    else
+        info.error = safe_string(err)
+        ok, err = pcall(function()
+            xform:call("set_Parent", nil)
+        end)
+        if ok then
+            info.ok = true
+            info.method = "set_Parent(nil)"
+        else
+            info.error = info.error .. " | set_Parent(nil): " .. safe_string(err)
+            ok, err = pcall(function()
+                xform:call("setParentDirect", nil)
+            end)
+            if ok then
+                info.ok = true
+                info.method = "setParentDirect(nil)"
+            else
+                info.error = info.error .. " | setParentDirect(nil): " .. safe_string(err)
+            end
+        end
+    end
+
+    if go and folder then
+        local folder_ok, folder_err = pcall(function()
+            go:call("set_FolderSelf", folder)
+        end)
+        info.folder_set = folder_ok and true or false
+        info.folder_error = folder_ok and "" or safe_string(folder_err)
+    end
+    if info.ok then
+        set_transform_pose(xform, pos, rot, scale)
+    end
+    info.after_position = read_position(xform)
+    info.after_local_position = read_local_position(xform)
+    return info
+end
+
+function update_visual_clone_pose(pose)
+    if not pose or not pose.valid then return false end
+    if state.puppet_independent_root then return false end
+    if state.puppet_local_hierarchy and state.puppet_xform and is_valid_managed(state.puppet_xform) then
+        local snap = state.local_snapshot
+        if not snap or not snap.valid then snap = make_local_snapshot() end
+        if snap and snap.valid then
+            local local_pos = world_delta_to_local_yaw(
+                snap,
+                (pose.px or 0) - (snap.px or 0),
+                (pose.py or 0) - (snap.py or 0),
+                (pose.pz or 0) - (snap.pz or 0)
+            )
+            local local_rot = quat_multiply(quat_conjugate(snapshot_rotation(snap)), pose_rotation(pose))
+            set_transform_local_pose(state.puppet_xform, local_pos, local_rot, nil)
+            return true
+        end
+    end
+
+    local handled = false
+    for _, unit in ipairs(state.puppet_visual_units or {}) do
+        if unit.xform and is_valid_managed(unit.xform) then
+            local offset = unit.offset or { x = 0, y = 0, z = 0 }
+            set_transform_pose(unit.xform, {
+                x = (pose.px or 0) + (offset.x or 0),
+                y = (pose.py or 0) + (offset.y or 0),
+                z = (pose.pz or 0) + (offset.z or 0),
+            }, unit.rotation, unit.scale)
+            handled = true
+        end
+    end
+    return handled
+end
+
+function call_static_game_object_create(args)
+    local td = sdk.find_type_definition("via.GameObject")
+    if not td then return nil, "via.GameObject type not found" end
+
+    local last_error = "no matching create overload"
+    for _, method in ipairs(td:get_methods()) do
+        local name = method:get_name() or ""
+        if name == "create" then
+            local params = 999
+            pcall(function() params = method:get_num_params() end)
+            if params == #args then
+                local result = nil
+                local ok, err = pcall(function()
+                    result = method:call(nil, unpack_args(args))
+                end)
+                if ok and result and is_valid_managed(result) then
+                    return result, method_signature(method)
+                end
+                last_error = method_signature(method) .. " -> " .. (ok and safe_string(result) or safe_string(err))
+            end
+        end
+    end
+
+    return nil, last_error
+end
+
+function create_visual_game_object(name, folder, fallback_go)
+    local errors = {}
+
+    local function try(label, fn)
+        local result = nil
+        local ok, err = pcall(function() result = fn() end)
+        if ok and result and is_valid_managed(result) then
+            return result
+        end
+        table.insert(errors, label .. " -> " .. (ok and safe_string(result) or safe_string(err)))
+        return nil
+    end
+
+    if folder then
+        local result, err = call_static_game_object_create({ name, folder })
+        if result then return result, "static folder" end
+        table.insert(errors, "static folder " .. safe_string(err))
+
+        if fallback_go then
+            local go = try("fallback create(System.String, via.Folder)", function()
+                return fallback_go:call("create(System.String, via.Folder)", name, folder)
+            end)
+            if go then return go, "fallback folder" end
+        end
+    end
+
+    local result, err = call_static_game_object_create({ name })
+    if result then return result, "static" end
+    table.insert(errors, "static " .. safe_string(err))
+
+    if fallback_go then
+        local go = try("fallback create(System.String)", function()
+            return fallback_go:call("create(System.String)", name)
+        end)
+        if go then return go, "fallback" end
+    end
+
+    return nil, table.concat(errors, "; ")
+end
+
+function create_mesh_component(go)
+    if not go then return nil, "no GameObject" end
+    local mesh_type = nil
+    pcall(function() mesh_type = sdk.typeof("via.render.Mesh") end)
+    if not mesh_type then return nil, "sdk.typeof(via.render.Mesh) failed" end
+
+    local component = nil
+    local errors = {}
+    for _, call_name in ipairs({ "createComponent(System.Type)", "createComponent" }) do
+        local ok, err = pcall(function()
+            component = go:call(call_name, mesh_type)
+        end)
+        if ok and component and is_valid_managed(component) then
+            return component, call_name
+        end
+        table.insert(errors, call_name .. " -> " .. (ok and safe_string(component) or safe_string(err)))
+    end
+    return nil, table.concat(errors, "; ")
+end
+
+function create_component_by_type_name(go, type_name)
+    if not go then return nil, "no GameObject" end
+    local component_type = nil
+    pcall(function() component_type = sdk.typeof(type_name) end)
+    if not component_type then return nil, "sdk.typeof(" .. safe_string(type_name) .. ") failed" end
+
+    local component = nil
+    local errors = {}
+    for _, call_name in ipairs({ "createComponent(System.Type)", "createComponent" }) do
+        local ok, err = pcall(function()
+            component = go:call(call_name, component_type)
+        end)
+        if ok and component and is_valid_managed(component) then
+            return component, call_name
+        end
+        table.insert(errors, call_name .. " -> " .. (ok and safe_string(component) or safe_string(err)))
+    end
+    return nil, table.concat(errors, "; ")
+end
+
+function copy_bool_mesh_property(src_mesh, dst_mesh, prop_name)
+    local value = nil
+    local ok_get = pcall(function() value = src_mesh:call("get_" .. prop_name) end)
+    if ok_get and value ~= nil then
+        pcall(function() dst_mesh:call("set_" .. prop_name, value) end)
+    end
+end
+
+function set_mesh_bool(mesh, prop_name, value)
+    pcall(function() mesh:call("set_" .. prop_name, value and true or false) end)
+end
+
+function set_mesh_float(mesh, prop_name, value)
+    pcall(function() mesh:call("set_" .. prop_name, value) end)
+end
+
+function read_mesh_bool(mesh, prop_name)
+    local value = nil
+    pcall(function() value = mesh and mesh:call("get_" .. prop_name) end)
+    return value
+end
+
+function mesh_render_status(mesh)
+    if not mesh then return {} end
+    return {
+        enabled = read_mesh_bool(mesh, "Enabled"),
+        mesh_ready = read_mesh_bool(mesh, "MeshReady"),
+        material_ready = read_mesh_bool(mesh, "MaterialReady"),
+        draw_default = read_mesh_bool(mesh, "DrawDefault"),
+        draw_shadow = read_mesh_bool(mesh, "DrawShadowCast"),
+        shared_skeleton = read_mesh_bool(mesh, "SharedSkeleton"),
+        static_mesh = read_mesh_bool(mesh, "StaticMesh"),
+        frustum_culling = read_mesh_bool(mesh, "FrustumCulling"),
+        occlusion_culling = read_mesh_bool(mesh, "OcclusionCulling"),
+        ignore_depth = read_mesh_bool(mesh, "IgnoreDepth"),
+        force_two_side = read_mesh_bool(mesh, "ForceTwoSide"),
+        mesh_holder = safe_string(trace_call(mesh, "getMesh")),
+        material_holder = safe_string(trace_call(mesh, "get_Material")),
+        shared_skeleton_ref = safe_string(trace_call(mesh, "get_SharedSkeletonGameObject")),
+    }
+end
+
+function apply_force_visible_mesh_flags(mesh)
+    if not mesh then return end
+    set_mesh_bool(mesh, "Enabled", true)
+    set_mesh_bool(mesh, "DrawDefault", true)
+    set_mesh_bool(mesh, "DrawShadowCast", false)
+    set_mesh_bool(mesh, "DrawRaytracing", false)
+    set_mesh_bool(mesh, "DrawDepthOcclusion", false)
+    set_mesh_bool(mesh, "DrawDepthBlocker", false)
+    set_mesh_bool(mesh, "FrustumCulling", false)
+    set_mesh_bool(mesh, "OcclusionCulling", false)
+    set_mesh_bool(mesh, "IgnoreDepth", true)
+    set_mesh_bool(mesh, "IgnoreDepthTransparentCorrection", true)
+    set_mesh_bool(mesh, "ForceTwoSide", true)
+    set_mesh_bool(mesh, "SharedSkeleton", false)
+    set_mesh_bool(mesh, "StaticMesh", false)
+    set_mesh_float(mesh, "SmallObjectCullingFactor", 0.0)
+    local scale = make_vec3(5, 5, 5)
+    if scale then
+        pcall(function() mesh:call("set_AutoBoundingBoxExtentScaling", scale) end)
+    end
+end
+
+function apply_force_static_mesh_flags(mesh)
+    apply_force_visible_mesh_flags(mesh)
+    set_mesh_bool(mesh, "StaticMesh", true)
+    set_mesh_bool(mesh, "SharedSkeleton", false)
+end
+
+function apply_lit_visible_mesh_flags(src_mesh, dst_mesh)
+    if not dst_mesh then return end
+    for _, prop in ipairs({
+        "StaticMesh",
+        "SharedSkeleton",
+        "DrawShadowCast",
+        "DrawRaytracing",
+        "ForceTwoSide",
+        "FrustumCulling",
+        "OcclusionCulling",
+        "ReceiveUserLighting",
+        "UseStencilValuePriority",
+    }) do
+        copy_bool_mesh_property(src_mesh, dst_mesh, prop)
+    end
+
+    set_mesh_bool(dst_mesh, "Enabled", true)
+    set_mesh_bool(dst_mesh, "DrawDefault", true)
+    set_mesh_bool(dst_mesh, "IgnoreDepth", false)
+    set_mesh_bool(dst_mesh, "IgnoreDepthTransparentCorrection", false)
+    set_mesh_bool(dst_mesh, "DrawDepthOcclusion", true)
+    set_mesh_bool(dst_mesh, "DrawDepthBlocker", true)
+end
+
+function read_mesh_u32(mesh, call_name, default)
+    local value = nil
+    pcall(function() value = mesh and mesh:call(call_name) end)
+    return tonumber(value) or default or 0
+end
+
+function wrapped_array_count(container, fallback)
+    if not container then return tonumber(fallback) or 0 end
+    local value = nil
+    for _, call_name in ipairs({ "get_Count", "get_Length", "get_Size", "get_Num", "getCount" }) do
+        local ok = pcall(function() value = container:call(call_name) end)
+        if ok and value ~= nil then return tonumber(value) or 0 end
+    end
+    return tonumber(fallback) or 0
+end
+
+function wrapped_array_get(container, index)
+    if not container then return nil, "" end
+    local value = nil
+    local errors = {}
+    for _, call_name in ipairs({
+        "get_Item(System.UInt32)",
+        "get_Item(System.Int32)",
+        "get_Item",
+        "get",
+        "getElement",
+    }) do
+        local ok, err = pcall(function() value = container:call(call_name, index) end)
+        if ok and value ~= nil then return value, call_name end
+        table.insert(errors, call_name .. ": " .. safe_string(err))
+    end
+    local ok, err = pcall(function() value = container[index] end)
+    if ok and value ~= nil then return value, "index" end
+    table.insert(errors, "index: " .. safe_string(err))
+    return nil, table.concat(errors, " | ")
+end
+
+function wrapped_array_set(container, index, value)
+    if not container or value == nil then return false, "missing container or value" end
+    local errors = {}
+    for _, call_name in ipairs({
+        "set_Item(System.UInt32)",
+        "set_Item(System.Int32)",
+        "set_Item",
+        "set",
+        "setElement",
+    }) do
+        local ok, err = pcall(function() container:call(call_name, index, value) end)
+        if ok then return true, call_name end
+        table.insert(errors, call_name .. ": " .. safe_string(err))
+    end
+    local ok, err = pcall(function() container[index] = value end)
+    if ok then return true, "index" end
+    table.insert(errors, "index: " .. safe_string(err))
+    return false, table.concat(errors, " | ")
+end
+
+function copy_wrapped_array(src_container, dst_container, fallback_count, limit)
+    local info = {
+        attempted = src_container ~= nil and dst_container ~= nil,
+        count = 0,
+        copied = 0,
+        first_get = "",
+        first_set = "",
+        first_error = "",
+    }
+    if not info.attempted then
+        info.first_error = "missing source or destination container"
+        return info
+    end
+
+    local count = wrapped_array_count(src_container, fallback_count)
+    info.count = count
+    local max_count = math.min(count, limit or 32)
+    for i = 0, max_count - 1 do
+        local value, get_method = wrapped_array_get(src_container, i)
+        if value ~= nil then
+            local ok_set, set_method = wrapped_array_set(dst_container, i, value)
+            if ok_set then
+                info.copied = info.copied + 1
+                if info.first_get == "" then info.first_get = safe_string(get_method) end
+                if info.first_set == "" then info.first_set = safe_string(set_method) end
+            elseif info.first_error == "" then
+                info.first_error = safe_string(set_method)
+            end
+        elseif info.first_error == "" then
+            info.first_error = safe_string(get_method)
+        end
+    end
+    return info
+end
+
+function copy_mesh_material_resources(src_mesh, dst_mesh, label)
+    local info = {
+        label = safe_string(label or ""),
+        source_material_holder = "",
+        source_material_ready = read_mesh_bool(src_mesh, "MaterialReady"),
+        before_material_holder = safe_string(trace_call(dst_mesh, "get_Material")),
+        before_material_ready = read_mesh_bool(dst_mesh, "MaterialReady"),
+        holder_set = false,
+        holder_method = "",
+        holder_error = "",
+        source_material_num = read_mesh_u32(src_mesh, "get_MaterialNum", 0),
+        dest_material_num_before = read_mesh_u32(dst_mesh, "get_MaterialNum", 0),
+    }
+
+    local material_holder = nil
+    pcall(function() material_holder = src_mesh and src_mesh:call("get_Material") end)
+    info.source_material_holder = safe_string(material_holder)
+
+    if material_holder then
+        for _, call_name in ipairs({ "set_Material(via.render.MeshMaterialResourceHolder)", "set_Material" }) do
+            local ok, err = pcall(function() dst_mesh:call(call_name, material_holder) end)
+            if ok then
+                info.holder_set = true
+                info.holder_method = call_name
+                break
+            elseif info.holder_error == "" then
+                info.holder_error = safe_string(err)
+            end
+        end
+    else
+        info.holder_error = "source get_Material returned nil"
+    end
+
+    local param_count = nil
+    pcall(function() param_count = src_mesh and src_mesh:call("get_MaterialParamCount") end)
+    info.source_material_param_count = tonumber(param_count) or 0
+    info.param_count_set = false
+    info.param_count_skipped = "disabled after via.render.Mesh.set_MaterialParamCount crash on 2026-07-01"
+
+    local src_materials, dst_materials = nil, nil
+    pcall(function() src_materials = src_mesh and src_mesh:call("get_Materials") end)
+    pcall(function() dst_materials = dst_mesh and dst_mesh:call("get_Materials") end)
+    info.materials_array = copy_wrapped_array(src_materials, dst_materials, info.source_material_num, 32)
+
+    local src_names, dst_names = nil, nil
+    pcall(function() src_names = src_mesh and src_mesh:call("get_MaterialNames") end)
+    pcall(function() dst_names = dst_mesh and dst_mesh:call("get_MaterialNames") end)
+    info.material_names_array = copy_wrapped_array(src_names, dst_names, info.source_material_num, 32)
+
+    info.slot_values = {
+        attempted = false,
+        skipped = "disabled after via.render.Mesh.getMaterialTexture crash on 2026-07-01",
+    }
+    info.dest_material_num_after = read_mesh_u32(dst_mesh, "get_MaterialNum", 0)
+    info.after_material_holder = safe_string(trace_call(dst_mesh, "get_Material"))
+    info.after_material_ready = read_mesh_bool(dst_mesh, "MaterialReady")
+    return info
+end
+
+function copy_mesh_component_resources(src_mesh, dst_mesh, label, lines, mode, copy_info)
+    mode = safe_string(mode or "shared_skeleton")
+    local mesh_holder = nil
+    pcall(function() mesh_holder = src_mesh and src_mesh:call("getMesh") end)
+    if copy_info then
+        copy_info.mesh_holder = safe_string(mesh_holder)
+    end
+
+    if not mesh_holder then
+        if lines then table.insert(lines, label .. " skipped: source getMesh returned nil") end
+        return false
+    end
+
+    local mesh_set = false
+    for _, call_name in ipairs({ "setMesh(via.render.MeshResourceHolder)", "setMesh" }) do
+        local ok = pcall(function() dst_mesh:call(call_name, mesh_holder) end)
+        if ok then
+            mesh_set = true
+            break
+        end
+    end
+    if not mesh_set then
+        if lines then table.insert(lines, label .. " failed: setMesh rejected holder " .. safe_string(mesh_holder)) end
+        return false
+    end
+    if copy_info then copy_info.mesh_set = true end
+
+    local material_info = copy_mesh_material_resources(src_mesh, dst_mesh, label .. " initial")
+    if copy_info then copy_info.material_initial = material_info end
+
+    if mode == "force_static" then
+        apply_force_static_mesh_flags(dst_mesh)
+    elseif mode == "force_visible" then
+        apply_force_visible_mesh_flags(dst_mesh)
+    elseif mode == "lit_visible" then
+        apply_lit_visible_mesh_flags(src_mesh, dst_mesh)
+    else
+        for _, prop in ipairs({
+            "StaticMesh",
+            "SharedSkeleton",
+            "DrawShadowCast",
+            "DrawRaytracing",
+            "ForceTwoSide",
+            "FrustumCulling",
+            "OcclusionCulling",
+            "ReceiveUserLighting",
+            "UseStencilValuePriority",
+        }) do
+            copy_bool_mesh_property(src_mesh, dst_mesh, prop)
+        end
+
+        pcall(function() dst_mesh:call("set_Enabled", true) end)
+        pcall(function() dst_mesh:call("set_DrawDefault", true) end)
+    end
+
+    local material_after_flags = copy_mesh_material_resources(src_mesh, dst_mesh, label .. " after_flags")
+    if copy_info then copy_info.material_after_flags = material_after_flags end
+    return true
+end
+
+function collect_live_mesh_units(mesh_controller, limit)
+    local units = {}
+    local mesh_unit_dictionary = nil
+    pcall(function() mesh_unit_dictionary = mesh_controller:get_field("<MeshUnitDictionary>k__BackingField") end)
+    if not mesh_unit_dictionary then return units end
+
+    pcall(function()
+        local iter = mesh_unit_dictionary:call("GetEnumerator")
+        if not iter then return end
+        for _ = 1, (limit or 32) do
+            local moved = iter:call("MoveNext")
+            if not moved then break end
+            local current = iter:call("get_Current")
+            local value = nil
+            pcall(function() value = current:call("get_Value") end)
+            if not value then value = current end
+            if trace_type_name(value):find("app.MeshUnit", 1, true) then
+                table.insert(units, value)
+            end
+        end
+    end)
+
+    if #units == 0 then
+        local count = trace_count(mesh_unit_dictionary)
+        for i = 0, math.min(count - 1, (limit or 32) - 1) do
+            local value = trace_item(mesh_unit_dictionary, i)
+            if trace_type_name(value):find("app.MeshUnit", 1, true) then
+                table.insert(units, value)
+            end
+        end
+    end
+
+    return units
+end
+
+function get_mesh_unit_dictionary(mesh_controller)
+    local dictionary = nil
+    pcall(function()
+        if mesh_controller then
+            dictionary = mesh_controller:get_field("<MeshUnitDictionary>k__BackingField")
+                or mesh_controller:call("get_MeshUnitDictionary")
+        end
+    end)
+    return dictionary
+end
+
+function find_mesh_unit_key_for_mesh(mesh_controller, mesh)
+    local dictionary = get_mesh_unit_dictionary(mesh_controller)
+    local mesh_text = safe_string(mesh)
+    local found = nil
+    pcall(function()
+        local iter = dictionary and dictionary:call("GetEnumerator")
+        if not iter then return end
+        for _ = 1, 256 do
+            local moved = iter:call("MoveNext")
+            if not moved then break end
+            local current = iter:call("get_Current")
+            local key, value = nil, nil
+            pcall(function() key = current:call("get_Key") end)
+            pcall(function() value = current:call("get_Value") end)
+            local value_mesh = nil
+            pcall(function() value_mesh = value and value:call("get_Mesh") end)
+            if safe_string(value_mesh) == mesh_text then
+                found = {
+                    key = tonumber(key),
+                    key_text = safe_string(key),
+                    mesh_unit = value,
+                    mesh_unit_type = trace_type_name(value),
+                    mesh_type = safe_string(trace_call(value, "get_MeshType")),
+                    game_object = safe_string(trace_call(value, "get_GameObject")),
+                }
+                return
+            end
+        end
+    end)
+    return found
+end
+
+function register_clone_mesh_unit(mesh_controller, clone_mesh, source_unit, report_lines)
+    local info = {
+        attempted = false,
+        ok = false,
+        before_count = trace_count(get_mesh_unit_dictionary(mesh_controller)),
+        after_count = 0,
+        source_mesh_type = "",
+        registered_key = nil,
+        registered_mesh_unit = "",
+        registered_mesh_unit_type = "",
+        error = "",
+    }
+    if not mesh_controller or not clone_mesh or not source_unit then
+        info.error = "missing mesh_controller/clone_mesh/source_unit"
+        return info
+    end
+
+    local mesh_type = nil
+    pcall(function() mesh_type = source_unit:call("get_MeshType") end)
+    info.source_mesh_type = safe_string(mesh_type)
+    if mesh_type == nil then
+        info.error = "source MeshUnit get_MeshType returned nil"
+        return info
+    end
+
+    info.attempted = true
+    local ok_register, err_register = pcall(function()
+        mesh_controller:call("registerMeshUnit(via.render.Mesh, app.MeshUnit.Type)", clone_mesh, mesh_type)
+    end)
+    if not ok_register then
+        ok_register, err_register = pcall(function()
+            mesh_controller:call("registerMeshUnit", clone_mesh, mesh_type)
+        end)
+    end
+    info.after_count = trace_count(get_mesh_unit_dictionary(mesh_controller))
+    if not ok_register then
+        info.error = safe_string(err_register)
+        if report_lines then
+            table.insert(report_lines, "registerMeshUnit failed: " .. info.error)
+        end
+        return info
+    end
+
+    local found = find_mesh_unit_key_for_mesh(mesh_controller, clone_mesh)
+    if found then
+        info.ok = true
+        info.registered_key = found.key
+        info.registered_key_text = found.key_text
+        info.registered_mesh_unit = safe_string(found.mesh_unit)
+        info.registered_mesh_unit_type = found.mesh_unit_type
+        info.registered_mesh_type = found.mesh_type
+        info.registered_game_object = found.game_object
+        pcall(function() found.mesh_unit:call("setDrawAndUpdate", true, true) end)
+        pcall(function() found.mesh_unit:call("setDrawDefault", true, "RE9MP") end)
+        pcall(function() found.mesh_unit:call("setDrawShadow", false, "RE9MP") end)
+    else
+        info.ok = true
+        info.error = "register call succeeded but clone mesh unit key not found"
+    end
+    info.notify_mesh_unit_changed = "skipped after NullReferenceException/crash on 2026-07-01"
+    return info
+end
+
+function run_visual_mesh_clone_probe(refs)
+    local report = {
+        time_ms = now_ms(),
+        scene = get_current_scene(),
+        ok = false,
+        local_player = refs and refs.valid and true or false,
+        local_error = refs and refs.error or "",
+        visual_clone_mode = safe_string(cfg.visual_clone_mode or "shared_skeleton"),
+        safety = {
+            clear_shared_skeleton_game_object = false,
+            notify_mesh_unit_changed = false,
+            set_material_param_count = false,
+        },
+        lines = {},
+        units = {},
+    }
+
+    if not refs or not refs.valid or not refs.go or not refs.xform then
+        local message = "visual mesh clone failed: no local player"
+        state.puppet_status = message
+        pcall(function() json.dump_file(VISUAL_SPAWN_PROBE_FILE, report) end)
+        return false, message
+    end
+
+    clear_puppet_refs("spawning visual mesh clone")
+
+    local mesh_controller = find_component_by_type_name(refs.go, "app.PlayerMeshController")
+    if not mesh_controller then
+        local message = "visual mesh clone failed: PlayerMeshController not found"
+        state.puppet_status = message
+        pcall(function() json.dump_file(VISUAL_SPAWN_PROBE_FILE, report) end)
+        return false, message
+    end
+
+    local units = collect_live_mesh_units(mesh_controller, 32)
+    report.source_mesh_units = #units
+    if #units == 0 then
+        local message = "visual mesh clone failed: MeshUnitDictionary empty"
+        state.puppet_status = message
+        pcall(function() json.dump_file(VISUAL_SPAWN_PROBE_FILE, report) end)
+        return false, message
+    end
+
+    local folder = get_spawn_folder(refs)
+    local visual_mode = safe_string(cfg.visual_clone_mode or "shared_skeleton")
+    local own_player_controller_independent_mode = visual_mode == "registered_own_player_controller_independent_lit"
+    local local_player_controller_independent_mode = visual_mode == "registered_player_controller_independent_lit"
+    local material_post_mode = visual_mode == "registered_player_child_material"
+        or visual_mode == "registered_player_material"
+        or visual_mode == "registered_player_material_lit"
+        or visual_mode == "registered_player_material_lit_local"
+        or visual_mode == "registered_player_material_lit_detach"
+        or visual_mode == "registered_player_material_lit_scene_detach"
+        or visual_mode == "registered_player_material_lit_owned_anchor_detach"
+        or visual_mode == "registered_own_player_controller_lit"
+        or own_player_controller_independent_mode
+        or local_player_controller_independent_mode
+    local registered_mode = visual_mode == "registered_player_controller"
+        or visual_mode == "registered_player_child"
+        or material_post_mode
+    local own_player_controller_mode = visual_mode == "registered_own_player_controller_lit"
+        or own_player_controller_independent_mode
+    local child_hierarchy_mode = (visual_mode == "registered_player_child" or material_post_mode)
+        and not own_player_controller_independent_mode
+        and not local_player_controller_independent_mode
+    local detach_after_register_mode = visual_mode == "registered_player_material_lit_detach"
+    local scene_detach_after_register_mode = visual_mode == "registered_player_material_lit_scene_detach"
+        or visual_mode == "registered_player_material_lit_owned_anchor_detach"
+    local local_hierarchy_mode = visual_mode == "registered_player_material_lit_local"
+        or detach_after_register_mode
+        or scene_detach_after_register_mode
+    local copy_mode = (visual_mode == "registered_player_material_lit"
+            or local_hierarchy_mode
+            or own_player_controller_mode
+            or local_player_controller_independent_mode) and "lit_visible"
+        or (registered_mode and "force_visible" or visual_mode)
+    local scene_anchor_go, scene_anchor_xform, scene_anchor_info = nil, nil, nil
+    if scene_detach_after_register_mode then
+        scene_anchor_info = {
+            attempted = true,
+            ok = false,
+            error = "not created yet",
+            created_by = "",
+            selected = nil,
+        }
+        report.scene_detach_anchor = scene_anchor_info
+    end
+    local root_go, root_created_by = create_visual_game_object("RE9MP Remote Grace Visual " .. visual_mode, folder, refs.go)
+    if not root_go then
+        local message = "visual mesh clone failed: create root GameObject: " .. safe_string(root_created_by)
+        state.puppet_status = message
+        table.insert(report.lines, message)
+        pcall(function() json.dump_file(VISUAL_SPAWN_PROBE_FILE, report) end)
+        return false, message
+    end
+
+    local root_xform = nil
+    pcall(function() root_xform = root_go:call("get_Transform") end)
+    local pose = get_spawn_pose(refs)
+    report.pose = {
+        x = pose.px or 0,
+        y = pose.py or 0,
+        z = pose.pz or 0,
+        qx = pose.qx or 0,
+        qy = pose.qy or 0,
+        qz = pose.qz or 0,
+        qw = pose.qw or 1,
+    }
+    if scene_detach_after_register_mode then
+        local anchor_created_by = ""
+        scene_anchor_go, anchor_created_by = create_visual_game_object("RE9MP Remote Grace Scene Anchor", folder, nil)
+        scene_anchor_info.created_by = safe_string(anchor_created_by)
+        if scene_anchor_go then
+            pcall(function() scene_anchor_xform = scene_anchor_go:call("get_Transform") end)
+            pcall(function() scene_anchor_go:call("set_Name", "RE9MP Remote Grace Scene Anchor") end)
+            pcall(function() scene_anchor_go:call("set_Draw", false) end)
+            pcall(function() scene_anchor_go:call("set_DrawSelf", false) end)
+            pcall(function() scene_anchor_go:call("set_UpdateSelf", true) end)
+            set_transform_pose(scene_anchor_xform, { x = 0, y = 0, z = 0 }, { x = 0, y = 0, z = 0, w = 1 }, nil)
+            scene_anchor_info.ok = scene_anchor_xform ~= nil
+            scene_anchor_info.error = scene_anchor_xform and "" or "anchor transform missing"
+            scene_anchor_info.selected = re9mp_describe_transform(scene_anchor_xform)
+        else
+            scene_anchor_info.error = "create anchor failed: " .. safe_string(anchor_created_by)
+        end
+        report.scene_detach_anchor = scene_anchor_info
+    end
+    set_transform_pose(root_xform, {
+        x = pose.px or 0,
+        y = pose.py or 0,
+        z = pose.pz or 0,
+    }, {
+        x = pose.qx or 0,
+        y = pose.qy or 0,
+        z = pose.qz or 0,
+        w = pose.qw or 1,
+    }, nil)
+    pcall(function() root_go:call("set_Name", "RE9MP Remote Grace Visual") end)
+    pcall(function() root_go:call("set_Draw", true) end)
+    pcall(function() root_go:call("set_DrawSelf", true) end)
+    pcall(function() root_go:call("set_UpdateSelf", true) end)
+    report.root_position_before_parent = read_position(root_xform)
+    local registration_mesh_controller = mesh_controller
+    if own_player_controller_mode then
+        local own_controller, own_controller_by = create_component_by_type_name(root_go, "app.PlayerMeshController")
+        report.own_player_controller = {
+            attempted = true,
+            created_by = safe_string(own_controller_by),
+            ref = safe_string(own_controller),
+            type = trace_type_name(own_controller),
+            before_search = re9mp_trace_mesh_controller_summary(own_controller, "own PlayerMeshController before search"),
+        }
+        if own_controller then
+            registration_mesh_controller = own_controller
+            pcall(function() own_controller:call("searchInitMeshUnits") end)
+            report.own_player_controller.after_search = re9mp_trace_mesh_controller_summary(own_controller, "own PlayerMeshController after search")
+        else
+            local message = "visual mesh clone failed: create own PlayerMeshController: " .. safe_string(own_controller_by)
+            state.puppet_status = message
+            table.insert(report.lines, message)
+            pcall(function() json.dump_file(VISUAL_SPAWN_PROBE_FILE, report) end)
+            return false, message
+        end
+    end
+    local local_snap = state.local_snapshot
+    if not local_snap or not local_snap.valid then
+        local_snap = make_local_snapshot()
+    end
+    if child_hierarchy_mode then
+        report.root_parenting = parent_transform_keep_world(root_xform, refs.xform)
+        if local_hierarchy_mode then
+            local local_pos = world_delta_to_local_yaw(
+                local_snap,
+                (pose.px or 0) - ((local_snap and local_snap.px) or 0),
+                (pose.py or 0) - ((local_snap and local_snap.py) or 0),
+                (pose.pz or 0) - ((local_snap and local_snap.pz) or 0)
+            )
+            local local_rot = quat_multiply(quat_conjugate(snapshot_rotation(local_snap)), pose_rotation(pose))
+            set_transform_local_pose(root_xform, local_pos, local_rot, nil)
+            report.root_local_hierarchy = true
+            report.root_local_pose_set = {
+                position = local_pos,
+                rotation = local_rot,
+            }
+        else
+            set_transform_pose(root_xform, {
+                x = pose.px or 0,
+                y = pose.py or 0,
+                z = pose.pz or 0,
+            }, {
+                x = pose.qx or 0,
+                y = pose.qy or 0,
+                z = pose.qz or 0,
+                w = pose.qw or 1,
+            }, nil)
+        end
+    end
+    report.root_position_after_parent = read_position(root_xform)
+    report.root_local_position_after_parent = read_local_position(root_xform)
+
+    local local_root_pos = read_position(refs.xform) or { x = pose.px or 0, y = pose.py or 0, z = pose.pz or 0 }
+    report.local_root_pos = local_root_pos
+    local created = 0
+
+    for i, unit in ipairs(units) do
+        local source_go, source_mesh = nil, nil
+        pcall(function() source_go = unit:call("get_GameObject") end)
+        pcall(function() source_mesh = unit:call("get_Mesh") end)
+
+        local row = {
+            index = i - 1,
+            mesh_unit = safe_string(unit),
+            source_go = safe_string(source_go),
+            source_mesh = safe_string(source_mesh),
+            source_mesh_type = trace_type_name(source_mesh),
+            source_mesh_unit_type = safe_string(trace_call(unit, "get_MeshType")),
+            source_render = mesh_render_status(source_mesh),
+        }
+
+        if source_mesh and source_go then
+            local clone_go, created_by = create_visual_game_object("RE9MP Remote Grace Mesh " .. visual_mode .. " " .. tostring(i - 1), folder, refs.go)
+            row.clone_create = safe_string(created_by)
+            if clone_go then
+                local clone_xform = nil
+                pcall(function() clone_xform = clone_go:call("get_Transform") end)
+
+                local source_xform = nil
+                pcall(function() source_xform = source_go:call("get_Transform") end)
+                local source_pos = read_position(source_xform) or local_root_pos
+                local source_rot = read_rotation(source_xform)
+                local source_scale = read_scale(source_xform)
+                local offset = {
+                    x = (source_pos.x or 0) - (local_root_pos.x or 0),
+                    y = (source_pos.y or 0) - (local_root_pos.y or 0),
+                    z = (source_pos.z or 0) - (local_root_pos.z or 0),
+                }
+                local local_offset = world_delta_to_local_yaw(local_snap, offset.x, offset.y, offset.z)
+                local local_rotation = quat_multiply(quat_conjugate(snapshot_rotation(local_snap)), source_rot)
+                row.source_pos = source_pos
+                row.offset = offset
+                row.local_offset = local_offset
+                row.local_rotation = local_rotation
+                set_transform_pose(clone_xform, {
+                    x = (pose.px or 0) + offset.x,
+                    y = (pose.py or 0) + offset.y,
+                    z = (pose.pz or 0) + offset.z,
+                }, source_rot, source_scale)
+                row.clone_position_before_parent = read_position(clone_xform)
+                if child_hierarchy_mode then
+                    row.parenting = parent_transform_keep_world(clone_xform, root_xform)
+                    if local_hierarchy_mode then
+                        set_transform_local_pose(clone_xform, local_offset, local_rotation, source_scale)
+                    else
+                        set_transform_pose(clone_xform, {
+                            x = (pose.px or 0) + offset.x,
+                            y = (pose.py or 0) + offset.y,
+                            z = (pose.pz or 0) + offset.z,
+                        }, source_rot, source_scale)
+                    end
+                end
+                row.clone_position_after_parent = read_position(clone_xform)
+                row.clone_local_position_after_parent = read_local_position(clone_xform)
+
+                local clone_mesh, mesh_component_by = create_mesh_component(clone_go)
+                row.clone_go = safe_string(clone_go)
+                row.clone_mesh = safe_string(clone_mesh)
+                row.clone_mesh_component = safe_string(mesh_component_by)
+
+                row.resource_copy = {}
+                if clone_mesh and copy_mesh_component_resources(source_mesh, clone_mesh, "unit " .. tostring(i - 1), report.lines, copy_mode, row.resource_copy) then
+                    local registration = nil
+                    if registered_mode then
+                        registration = register_clone_mesh_unit(registration_mesh_controller, clone_mesh, unit, report.lines)
+                        row.registration = registration
+                    end
+                    if material_post_mode then
+                        row.material_post_register = copy_mesh_material_resources(source_mesh, clone_mesh, "unit " .. tostring(i - 1) .. " post_register")
+                    end
+                    pcall(function() clone_go:call("set_Draw", true) end)
+                    pcall(function() clone_go:call("set_DrawSelf", true) end)
+                    pcall(function() clone_go:call("set_UpdateSelf", true) end)
+                    pcall(function() clone_mesh:call("set_Enabled", true) end)
+                    row.clone_position_final = read_position(clone_xform)
+                    row.clone_local_position_final = read_local_position(clone_xform)
+                    local stored_unit = {
+                        go = hold_managed_ref(clone_go),
+                        xform = hold_managed_ref(clone_xform),
+                        mesh = hold_managed_ref(clone_mesh),
+                        offset = offset,
+                        local_offset = local_offset,
+                        local_rotation = local_rotation,
+                        rotation = source_rot,
+                        scale = source_scale,
+                        parented = child_hierarchy_mode,
+                        local_hierarchy = local_hierarchy_mode,
+                    }
+                    if registration and registration.registered_key ~= nil then
+                        stored_unit.registration_controller = hold_managed_ref(registration_mesh_controller)
+                        stored_unit.registration_key = registration.registered_key
+                    end
+                    table.insert(state.puppet_visual_units, stored_unit)
+                    created = created + 1
+                    row.ok = true
+                    row.clone_render = mesh_render_status(clone_mesh)
+                else
+                    hide_game_object(clone_go)
+                    row.ok = false
+                    row.clone_render = mesh_render_status(clone_mesh)
+                end
+            else
+                row.ok = false
+            end
+        else
+            row.ok = false
+        end
+        table.insert(report.units, row)
+    end
+
+    local detach_ok = false
+    if (detach_after_register_mode or scene_detach_after_register_mode) and created > 0 then
+        local pose_pos = {
+            x = pose.px or 0,
+            y = pose.py or 0,
+            z = pose.pz or 0,
+        }
+        local pose_rot = {
+            x = pose.qx or 0,
+            y = pose.qy or 0,
+            z = pose.qz or 0,
+            w = pose.qw or 1,
+        }
+        if scene_detach_after_register_mode then
+            report.detach_after_register = scene_anchor_xform
+                and parent_transform_keep_world(root_xform, scene_anchor_xform)
+                or { attempted = false, ok = false, method = "scene_anchor", error = scene_anchor_info and scene_anchor_info.error or "no scene anchor" }
+            if report.detach_after_register and report.detach_after_register.ok then
+                report.detach_after_register.method = "scene_anchor:" .. safe_string(report.detach_after_register.method)
+                if root_go and folder then
+                    pcall(function() root_go:call("set_FolderSelf", folder) end)
+                end
+                set_transform_pose(root_xform, pose_pos, pose_rot, nil)
+            end
+        else
+            report.detach_after_register = detach_transform_keep_world(root_go, root_xform, folder, pose_pos, pose_rot, nil)
+        end
+        detach_ok = report.detach_after_register and report.detach_after_register.ok and true or false
+        local child_local_reset = 0
+        for _, unit in ipairs(state.puppet_visual_units or {}) do
+            if unit.xform and is_valid_managed(unit.xform) then
+                set_transform_local_pose(unit.xform, unit.local_offset or unit.offset, unit.local_rotation or unit.rotation, unit.scale)
+                child_local_reset = child_local_reset + 1
+            end
+            pcall(function()
+                if unit.go and folder then unit.go:call("set_FolderSelf", folder) end
+            end)
+        end
+        report.detach_child_local_reset = child_local_reset
+        report.detach_root_position_final = read_position(root_xform)
+        report.detach_root_local_position_final = read_local_position(root_xform)
+    end
+
+    state.puppet_go = hold_managed_ref(root_go)
+    state.puppet_xform = hold_managed_ref(root_xform)
+    state.puppet_anchor_go = scene_anchor_go and hold_managed_ref(scene_anchor_go) or nil
+    state.puppet_root_parented = child_hierarchy_mode and not detach_ok
+    state.puppet_local_hierarchy = local_hierarchy_mode and not detach_ok
+    state.puppet_independent_root = detach_ok
+    report.created_units = created
+    report.ok = created > 0
+
+    if created > 0 then
+        state.puppet_status = "visual mesh clone spawned units=" .. tostring(created)
+    else
+        clear_puppet_refs("visual mesh clone failed: no mesh components copied")
+    end
+
+    report.status = state.puppet_status
+    pcall(function() json.dump_file(VISUAL_SPAWN_PROBE_FILE, report) end)
+    return created > 0, state.puppet_status
+end
+
+function re9mp_run_grace_ownership_recipe_dump()
+    local refs = get_local_player_refs()
+    local report = {
+        time_ms = now_ms(),
+        scene = get_current_scene(),
+        local_player = refs and refs.valid and true or false,
+        local_error = refs and refs.error or "",
+        trace = {
+            mode = safe_string(state.trace_mode or ""),
+            spawn_hook_status = state.spawn_hook_status,
+            spawn_hook_events = #state.spawn_hook_events,
+            level_trace_status = state.level_trace_status,
+            level_trace_events = #state.level_trace_events,
+            pool_trace_status = state.pool_trace_status,
+            pool_trace_events = #state.pool_trace_events,
+            bind_trace_status = state.bind_trace_status,
+            bind_trace_events = #state.bind_trace_events,
+            bind_trace_errors = #(state.bind_trace_errors or {}),
+        },
+        character_manager = {},
+        local_player_refs = {},
+        network = {
+            native_status = state.status or {},
+            remote_samples = #state.remote_samples,
+            remote_last_seq = state.remote_last_seq,
+            remote_prev_seq = state.remote_prev_seq,
+        },
+        mesh_ownership = {
+            controllers = {},
+            units = {},
+        },
+        trace_samples = {
+            spawn_recent = {},
+            level_recent = {},
+            bind_recent = {},
+            pool_recent = {},
+        },
+        conclusions = {
+            visible_control_path = "registered_player_material_lit remains the parented proof/control path",
+            detached_mesh_only_result = "null/scene-folder detach kept objects alive but made Grace invisible",
+            next_required_context = "independent Character/MeshController ownership context or true prefab/character spawn",
+        },
+    }
+
+    local function recent(src, limit)
+        local out = {}
+        local count = #(src or {})
+        local first = math.max(1, count - (limit or 40) + 1)
+        for i = first, count do
+            table.insert(out, src[i])
+        end
+        return out
+    end
+
+    report.trace_samples.spawn_recent = recent(state.spawn_hook_events, 60)
+    report.trace_samples.level_recent = recent(state.level_trace_events, 80)
+    report.trace_samples.bind_recent = recent(state.bind_trace_events, 100)
+    report.trace_samples.pool_recent = recent(state.pool_trace_events, 20)
+
+    local char_mgr = sdk.get_managed_singleton("app.CharacterManager")
+    report.character_manager.ref = safe_string(char_mgr)
+    if char_mgr then
+        local player_list = nil
+        local spawnable_list = nil
+        local pool_list = nil
+        local spawn_data_db = nil
+        local context_db = nil
+        local spawn_owner = nil
+        pcall(function() player_list = char_mgr:get_field("<PlayerContextList>k__BackingField") end)
+        pcall(function() spawnable_list = char_mgr:get_field("<SpawnableContextList>k__BackingField") end)
+        pcall(function() pool_list = char_mgr:get_field("<CharacterPool>k__BackingField") end)
+        pcall(function() spawn_data_db = char_mgr:get_field("<CharacterSpawnDataDB>k__BackingField") end)
+        pcall(function() context_db = char_mgr:get_field("<CharacterContextDB>k__BackingField") end)
+        pcall(function() spawn_owner = char_mgr:get_field("<SpawnOwnerDictionary>k__BackingField") end)
+        report.character_manager.counts = {
+            player_contexts = trace_count(player_list),
+            spawnable_contexts = trace_count(spawnable_list),
+            character_pool = trace_count(pool_list),
+            spawn_data_db = trace_count(spawn_data_db),
+            context_db = trace_count(context_db),
+            spawn_owner = trace_count(spawn_owner),
+        }
+        report.character_manager_counts = report.character_manager.counts
+        report.character_manager.player_contexts = {}
+        report.character_manager.pool = {}
+        for i = 0, math.min((report.character_manager.counts.player_contexts or 0) - 1, 7) do
+            table.insert(report.character_manager.player_contexts, trace_context_summary(trace_item(player_list, i), i))
+        end
+        for i = 0, math.min((report.character_manager.counts.character_pool or 0) - 1, 63) do
+            local row = trace_pool_summary(trace_item(pool_list, i), i)
+            if row.updater ~= "" or row.used ~= nil or row.reserved ~= nil or row.finalized ~= nil then
+                table.insert(report.character_manager.pool, row)
+            end
+        end
+    end
+
+    if refs and refs.valid then
+        report.local_player_refs = {
+            player = safe_string(refs.player),
+            player_type = trace_type_name(refs.player),
+            game_object = safe_string(refs.go),
+            game_object_name = safe_string(trace_call(refs.go, "get_Name")),
+            transform = safe_string(refs.xform),
+            position = read_position(refs.xform),
+            rotation = read_rotation(refs.xform),
+            context_id = safe_string(re9mp_trace_value(refs.player, {"get_ContextID"}, {
+                "<ContextID>k__BackingField", "_ContextID", "ContextID",
+            })),
+            character_kind_id = safe_string(re9mp_trace_value(refs.player, {"get_CharacterKindID"}, {
+                "<CharacterKindID>k__BackingField", "_CharacterKindID", "CharacterKindID",
+            })),
+            updater = safe_string(trace_call(refs.player, "get_Updater")),
+            updater_type = trace_type_name(trace_call(refs.player, "get_Updater")),
+        }
+
+        local player_mesh_controller = find_component_by_type_name(refs.go, "app.PlayerMeshController")
+        local actor_mesh_controller = find_component_by_type_name(refs.go, "app.ActorPlayerMeshController")
+        report.mesh_ownership.controllers.player = re9mp_trace_mesh_controller_summary(player_mesh_controller, "PlayerMeshController")
+        report.mesh_ownership.controllers.actor_player = re9mp_trace_mesh_controller_summary(actor_mesh_controller, "ActorPlayerMeshController")
+
+        local units = collect_live_mesh_units(player_mesh_controller, 48)
+        report.mesh_ownership.unit_count = #units
+        for i, unit in ipairs(units) do
+            local row = re9mp_trace_mesh_unit_summary(unit, i - 1)
+            row.render = mesh_render_status(trace_call(unit, "get_Mesh"))
+            table.insert(report.mesh_ownership.units, row)
+        end
+    end
+
+    report.trace_status = report.trace
+    pcall(function() json.dump_file(GRACE_OWNERSHIP_RECIPE_FILE, report) end)
+    return true, "grace ownership recipe dumped units=" .. tostring(report.mesh_ownership.unit_count or 0)
+end
+
+function re9mp_start_grace_ownership_trace(reason)
+    local label = safe_string(reason or "grace ownership trace")
+    state.trace_mode = "level_or_reload"
+    state.spawn_hook_events = {}
+    state.spawn_hook_dirty = true
+    state.spawn_hook_status = "cleared for " .. label
+    clear_puppet_refs("despawned")
+    state.remote_samples = {}
+    state.remote_last_seq = nil
+    cfg.local_dummy = false
+    cfg.auto_spawn_puppet = false
+    cfg.level_trace_enabled = true
+    cfg.pool_trace_enabled = true
+    cfg.bind_trace_enabled = true
+    cfg.controller_trace_enabled = true
+    save_cfg()
+
+    state.level_trace_enabled = true
+    state.pool_trace_enabled = true
+    state.bind_trace_enabled = true
+    state.spawn_hook_enabled = true
+    reset_level_trace(label)
+    reset_pool_trace(label)
+    reset_bind_trace(label)
+    push_pool_trace_event("grace ownership trace start", true)
+    install_spawn_observer_hooks()
+    install_bind_trace_hooks()
+    dump_spawn_hook_log(true)
+    dump_level_trace(true)
+    dump_pool_trace(true)
+    dump_bind_trace(true)
+    return true, "grace ownership trace started; reload the level/scene, then stop_grace_ownership_trace"
+end
+
+function re9mp_start_join_ownership_trace(reason)
+    local label = safe_string(reason or "gameplay load ownership trace")
+    state.trace_mode = "gameplay_load"
+    state.spawn_hook_events = {}
+    state.spawn_hook_dirty = true
+    state.spawn_hook_status = "cleared for " .. label
+    clear_puppet_refs("despawned")
+    state.remote_samples = {}
+    state.remote_last_seq = nil
+    state.remote_prev_seq = nil
+    cfg.local_dummy = false
+    cfg.auto_spawn_puppet = false
+    cfg.level_trace_enabled = true
+    cfg.pool_trace_enabled = true
+    cfg.bind_trace_enabled = true
+    cfg.controller_trace_enabled = true
+    save_cfg()
+
+    state.level_trace_enabled = true
+    state.pool_trace_enabled = true
+    state.bind_trace_enabled = true
+    state.spawn_hook_enabled = true
+    reset_level_trace(label)
+    reset_pool_trace(label)
+    reset_bind_trace(label)
+    push_pool_trace_event("join ownership trace start", true)
+    install_spawn_observer_hooks()
+    install_bind_trace_hooks()
+    dump_spawn_hook_log(true)
+    dump_level_trace(true)
+    dump_pool_trace(true)
+    dump_bind_trace(true)
+    return true, "gameplay load ownership trace started; load the save/level now, then stop_join_ownership_trace"
+end
+
+function re9mp_stop_grace_ownership_trace()
+    push_pool_trace_event("grace ownership trace stop", true)
+    state.level_trace_enabled = false
+    state.pool_trace_enabled = false
+    state.bind_trace_enabled = false
+    state.spawn_hook_enabled = false
+    cfg.level_trace_enabled = false
+    cfg.pool_trace_enabled = false
+    cfg.bind_trace_enabled = false
+    save_cfg()
+    state.level_trace_status = "stopped events=" .. tostring(#state.level_trace_events)
+    state.pool_trace_status = "stopped events=" .. tostring(#state.pool_trace_events)
+    state.bind_trace_status = "stopped events=" .. tostring(#state.bind_trace_events)
+    dump_spawn_hook_log(true)
+    dump_level_trace(true)
+    dump_pool_trace(true)
+    dump_bind_trace(true)
+    local ok, recipe_message = re9mp_run_grace_ownership_recipe_dump()
+    return ok, "grace ownership trace stopped level=" .. tostring(#state.level_trace_events)
+        .. " bind=" .. tostring(#state.bind_trace_events)
+        .. " pool=" .. tostring(#state.pool_trace_events)
+        .. " spawn=" .. tostring(#state.spawn_hook_events)
+        .. " | " .. safe_string(recipe_message)
+end
+
+function re9mp_stop_join_ownership_trace()
+    return re9mp_stop_grace_ownership_trace()
+end
+
 local function run_resource_probe(custom_path)
     local inputs = {}
     if custom_path and safe_string(custom_path) ~= "" then
@@ -4267,6 +6882,9 @@ local function try_spawn_puppet(manual)
     local prefab_ok, prefab_err = try_spawn_prefab_candidate(refs)
     if prefab_ok then return true end
 
+    local visual_ok, visual_err = run_visual_mesh_clone_probe(refs)
+    if visual_ok then return true end
+
     local character_err = ""
     if manual then
         local character_ok, err = try_character_manager_spawn(refs)
@@ -4292,7 +6910,10 @@ local function try_spawn_puppet(manual)
     end
 
     if not clone then
-        state.puppet_status = "prefab failed: " .. safe_string(prefab_err) .. character_err .. " | clone method not found yet"
+        state.puppet_status = "prefab failed: " .. safe_string(prefab_err)
+            .. " | visual mesh: " .. safe_string(visual_err)
+            .. character_err
+            .. " | clone method not found yet"
         return false
     end
 
@@ -4313,14 +6934,143 @@ local function try_spawn_puppet(manual)
     return true
 end
 
-local function despawn_puppet()
-    if state.puppet_go then
-        pcall(function() state.puppet_go:call("set_Draw", false) end)
-        pcall(function() state.puppet_go:call("set_Active", false) end)
+function re9mp_run_raw_gameobject_clone_probe()
+    local refs = get_local_player_refs()
+    local report = {
+        time_ms = now_ms(),
+        scene = get_current_scene(),
+        local_player = refs and refs.valid and true or false,
+        local_error = refs and refs.error or "",
+        source_go = safe_string(refs and refs.go),
+        source_go_name = safe_string(refs and refs.name),
+        source_components = refs and refs.go and component_summary_for_go(refs.go, 120) or "",
+        candidates = {},
+        attempts = {},
+        ok = false,
+        status = "",
+    }
+
+    if not refs or not refs.valid or not refs.go then
+        report.status = "raw clone probe failed: " .. safe_string(refs and refs.error)
+        state.puppet_status = report.status
+        pcall(function() json.dump_file(DATA_PREFIX .. "raw_gameobject_clone_probe.json", report) end)
+        return false, report.status
     end
-    state.puppet_go = nil
-    state.puppet_xform = nil
-    state.puppet_status = "despawned"
+
+    clear_puppet_refs("raw clone probe")
+
+    local exact_names = {
+        clone = true,
+        Clone = true,
+        copy = true,
+        Copy = true,
+        duplicate = true,
+        Duplicate = true,
+        instantiate = true,
+        Instantiate = true,
+        createClone = true,
+        CreateClone = true,
+    }
+    local td = nil
+    pcall(function() td = refs.go:get_type_definition() end)
+    local seen_types = {}
+    local depth = 0
+    local success = false
+
+    while td and depth < 8 and not success do
+        local type_name = td:get_full_name() or "?"
+        if seen_types[type_name] then break end
+        seen_types[type_name] = true
+
+        for _, method in ipairs(td:get_methods()) do
+            local name = method:get_name() or ""
+            local params = 999
+            pcall(function() params = method:get_num_params() end)
+            local ret = method:get_return_type()
+            local ret_name = ret and ret:get_full_name() or ""
+            local interesting = name:find("clone") or name:find("Clone")
+                or name:find("copy") or name:find("Copy")
+                or name:find("duplicate") or name:find("Duplicate")
+                or name:find("instantiate") or name:find("Instantiate")
+            if interesting then
+                local row = {
+                    declaring_type = type_name,
+                    signature = method_signature(method),
+                    params = params,
+                    return_type = ret_name,
+                    called = false,
+                    ok = false,
+                    error = "",
+                    result = "",
+                    result_type = "",
+                    result_components = "",
+                    adopted = false,
+                }
+                table.insert(report.candidates, row)
+
+                if params == 0 and exact_names[name] and #report.attempts < 12 then
+                    row.called = true
+                    local result = nil
+                    local ok_call, err_call = pcall(function()
+                        result = method:call(refs.go)
+                    end)
+                    row.ok = ok_call and result ~= nil and is_valid_managed(result)
+                    row.error = ok_call and (result and "" or "nil") or safe_string(err_call)
+                    row.result = safe_string(result)
+                    row.result_type = trace_type_name(result)
+
+                    local result_go = nil
+                    local result_xform = nil
+                    pcall(function() result_xform = result and result:call("get_Transform") end)
+                    if not result_xform then
+                        pcall(function()
+                            local rtd = result and result:get_type_definition()
+                            if rtd and rtd:get_full_name() == "via.Transform" then
+                                result_xform = result
+                            end
+                        end)
+                    end
+                    pcall(function() result_go = result_xform and result_xform:call("get_GameObject") end)
+                    if result_go then
+                        row.result_go = safe_string(result_go)
+                        row.result_go_name = safe_string(trace_call(result_go, "get_Name"))
+                        row.result_components = component_summary_for_go(result_go, 120)
+                    end
+
+                    table.insert(report.attempts, row)
+                    if result and safe_string(result) ~= safe_string(refs.go) then
+                        local adopted = adopt_puppet_from_result(result, "raw " .. row.signature)
+                        row.adopted = adopted and true or false
+                        if adopted then
+                            report.ok = true
+                            report.status = "raw GameObject clone adopted via " .. row.signature
+                            success = true
+                            break
+                        end
+                    end
+                end
+
+                if #report.candidates >= 80 then break end
+            end
+        end
+
+        td = get_parent_type_definition(td)
+        depth = depth + 1
+    end
+
+    if not report.ok then
+        report.status = "raw GameObject clone probe found no usable no-arg clone/copy/instantiate method"
+        state.puppet_status = report.status
+    else
+        state.puppet_status = report.status
+    end
+
+    pcall(function() json.dump_file(DATA_PREFIX .. "raw_gameobject_clone_probe.json", report) end)
+    return report.ok, report.status .. " candidates=" .. tostring(#report.candidates) .. " attempts=" .. tostring(#report.attempts)
+end
+
+local function despawn_puppet()
+    clear_puppet_refs("despawned")
 end
 
 local function write_dev_result(id, ok, message)
@@ -4347,6 +7097,9 @@ local function write_dev_result(id, ok, message)
             pool_trace_events = #state.pool_trace_events,
             bind_trace_status = state.bind_trace_status,
             bind_trace_events = #state.bind_trace_events,
+            load_phase_injection_status = state.load_phase_injection_status,
+            load_phase_injection_armed = state.load_phase_injection_armed,
+            load_phase_injection_done = state.load_phase_injection_done,
             component_resource_status = state.component_resource_status,
             visual_probe_status = state.visual_probe_status,
         })
@@ -4375,10 +7128,59 @@ local function poll_dev_command()
         end
         save_cfg()
         message = "local_dummy=" .. tostring(cfg.local_dummy)
+    elseif action == "set_dummy_ahead" then
+        cfg.local_dummy = true
+        cfg.dummy_offset_x = 0
+        cfg.dummy_offset_y = 0
+        cfg.dummy_offset_z = 2.4
+        state.remote_samples = {}
+        state.remote_last_seq = nil
+        save_cfg()
+        message = "local_dummy=true offset=0,0,2.4"
+    elseif action == "set_dummy_static_ahead" then
+        ok, message = set_static_dummy_ahead(2.4)
+    elseif action == "set_dummy_offset" then
+        local text = safe_string(cmd.text or "")
+        local x, y, z = text:match("^%s*([%-%.%d]+)%s*,%s*([%-%.%d]+)%s*,%s*([%-%.%d]+)%s*$")
+        if not x then
+            x, z = text:match("^%s*([%-%.%d]+)%s*,%s*([%-%.%d]+)%s*$")
+            y = "0"
+        end
+        if x and y and z then
+            cfg.local_dummy = true
+            cfg.dummy_offset_x = tonumber(x) or 0
+            cfg.dummy_offset_y = tonumber(y) or 0
+            cfg.dummy_offset_z = tonumber(z) or 0
+            state.remote_samples = {}
+            state.remote_last_seq = nil
+            save_cfg()
+            message = string.format("local_dummy=true offset=%.2f,%.2f,%.2f", cfg.dummy_offset_x, cfg.dummy_offset_y, cfg.dummy_offset_z)
+        else
+            ok = false
+            message = "set_dummy_offset expects Text like x,z or x,y,z"
+        end
     elseif action == "set_marker" then
         cfg.draw_remote_marker = cmd.value and true or false
         save_cfg()
         message = "draw_remote_marker=" .. tostring(cfg.draw_remote_marker)
+    elseif action == "set_visual_clone_mode" then
+        local mode = safe_string(cmd.text or "")
+        if mode == "shared_skeleton" or mode == "force_visible" or mode == "force_static"
+            or mode == "registered_player_controller" or mode == "registered_player_child"
+            or mode == "registered_player_child_material" or mode == "registered_player_material"
+            or mode == "registered_player_material_lit" or mode == "registered_player_material_lit_detach"
+            or mode == "registered_player_material_lit_scene_detach"
+            or mode == "registered_player_material_lit_owned_anchor_detach"
+            or mode == "registered_own_player_controller_lit"
+            or mode == "registered_own_player_controller_independent_lit"
+            or mode == "registered_player_controller_independent_lit" then
+            cfg.visual_clone_mode = mode
+            save_cfg()
+            message = "visual_clone_mode=" .. mode
+        else
+            ok = false
+            message = "set_visual_clone_mode expects shared_skeleton, force_visible, force_static, registered_player_controller, registered_player_child, registered_player_child_material, registered_player_material, registered_player_material_lit, registered_player_material_lit_detach, registered_player_material_lit_scene_detach, registered_player_material_lit_owned_anchor_detach, registered_own_player_controller_lit, registered_own_player_controller_independent_lit, or registered_player_controller_independent_lit"
+        end
     elseif action == "despawn" then
         despawn_puppet()
         message = "despawned"
@@ -4389,8 +7191,44 @@ local function poll_dev_command()
     elseif action == "spawn_hook_status" then
         dump_spawn_hook_log(true)
         message = state.spawn_hook_status .. " events=" .. tostring(#state.spawn_hook_events)
+    elseif action == "runtime_safety_status" then
+        message = "reload_safe auto_spawn=" .. tostring(cfg.auto_spawn_puppet)
+            .. " spawn_hook_enabled=" .. tostring(state.spawn_hook_enabled)
+            .. " spawn_hook_attempted=" .. tostring(state.spawn_hook_attempted)
+            .. " pool_trace_enabled=" .. tostring(state.pool_trace_enabled)
+            .. " bind_trace_enabled=" .. tostring(state.bind_trace_enabled)
+            .. " bind_trace_attempted=" .. tostring(state.bind_trace_attempted)
+            .. " controller_trace_enabled=" .. tostring(cfg.controller_trace_enabled)
+            .. " trace_mode=" .. safe_string(state.trace_mode or "")
+            .. " load_phase_injection_armed=" .. tostring(state.load_phase_injection_armed)
+            .. " load_phase_injection_done=" .. tostring(state.load_phase_injection_done)
+            .. " load_phase_injection_status=" .. safe_string(state.load_phase_injection_status)
+            .. " visual_clone_mode=" .. safe_string(cfg.visual_clone_mode)
+            .. " clone_safety=no_skeleton_ref_no_notify_no_material_param_count"
+    elseif action == "start_spawn_hooks" then
+        state.spawn_hook_enabled = true
+        install_spawn_observer_hooks()
+        dump_spawn_hook_log(true)
+        message = state.spawn_hook_status .. " events=" .. tostring(#state.spawn_hook_events)
+    elseif action == "start_grace_ownership_trace" then
+        ok, message = re9mp_start_grace_ownership_trace(cmd.text ~= "" and cmd.text or "dev command")
+    elseif action == "stop_grace_ownership_trace" then
+        ok, message = re9mp_stop_grace_ownership_trace()
+    elseif action == "start_join_ownership_trace" then
+        ok, message = re9mp_start_join_ownership_trace(cmd.text ~= "" and cmd.text or "dev command")
+    elseif action == "stop_join_ownership_trace" then
+        ok, message = re9mp_stop_join_ownership_trace()
+    elseif action == "dump_grace_ownership_recipe" then
+        ok, message = re9mp_run_grace_ownership_recipe_dump()
+    elseif action == "arm_load_phase_player_clone_injection" then
+        ok, message = re9mp_arm_load_phase_player_clone_injection(cmd.text)
+    elseif action == "cancel_load_phase_player_clone_injection" then
+        ok, message = re9mp_cancel_load_phase_player_clone_injection()
+    elseif action == "dump_load_phase_injection_probe" then
+        ok, message = re9mp_dump_load_phase_injection_probe("dev command")
     elseif action == "start_level_trace" then
         state.level_trace_enabled = true
+        state.spawn_hook_enabled = true
         cfg.level_trace_enabled = true
         save_cfg()
         reset_level_trace(cmd.text ~= "" and cmd.text or "dev command")
@@ -4398,6 +7236,7 @@ local function poll_dev_command()
         message = state.level_trace_status
     elseif action == "stop_level_trace" then
         state.level_trace_enabled = false
+        state.spawn_hook_enabled = false
         cfg.level_trace_enabled = false
         save_cfg()
         state.level_trace_status = "stopped events=" .. tostring(#state.level_trace_events)
@@ -4456,6 +7295,79 @@ local function poll_dev_command()
         ok, message = run_component_resource_probe()
     elseif action == "visual_component_probe" then
         ok, message = run_visual_component_probe()
+    elseif action == "mesh_registration_probe" then
+        ok, message = run_mesh_registration_probe()
+    elseif action == "spawn_visual_mesh_clone" then
+        if cfg.visual_clone_mode == nil or cfg.visual_clone_mode == "" then
+            cfg.visual_clone_mode = "shared_skeleton"
+        end
+        local refs = get_local_player_refs()
+        ok, message = run_visual_mesh_clone_probe(refs)
+    elseif action == "spawn_visual_mesh_clone_force_visible" then
+        cfg.visual_clone_mode = "force_visible"
+        save_cfg()
+        local refs = get_local_player_refs()
+        ok, message = run_visual_mesh_clone_probe(refs)
+    elseif action == "spawn_visual_mesh_clone_force_static" then
+        cfg.visual_clone_mode = "force_static"
+        save_cfg()
+        local refs = get_local_player_refs()
+        ok, message = run_visual_mesh_clone_probe(refs)
+    elseif action == "spawn_visual_mesh_clone_registered" then
+        cfg.visual_clone_mode = "registered_player_controller"
+        save_cfg()
+        local refs = get_local_player_refs()
+        ok, message = run_visual_mesh_clone_probe(refs)
+    elseif action == "spawn_visual_mesh_clone_registered_child" then
+        cfg.visual_clone_mode = "registered_player_child"
+        save_cfg()
+        local refs = get_local_player_refs()
+        ok, message = run_visual_mesh_clone_probe(refs)
+    elseif action == "spawn_visual_mesh_clone_registered_child_material" then
+        cfg.visual_clone_mode = "registered_player_child_material"
+        save_cfg()
+        local refs = get_local_player_refs()
+        ok, message = run_visual_mesh_clone_probe(refs)
+    elseif action == "spawn_visual_mesh_clone_registered_material" then
+        cfg.visual_clone_mode = "registered_player_material"
+        save_cfg()
+        local refs = get_local_player_refs()
+        ok, message = run_visual_mesh_clone_probe(refs)
+    elseif action == "spawn_visual_mesh_clone_registered_material_lit" then
+        cfg.visual_clone_mode = "registered_player_material_lit"
+        save_cfg()
+        local refs = get_local_player_refs()
+        ok, message = run_visual_mesh_clone_probe(refs)
+    elseif action == "spawn_visual_mesh_clone_registered_material_lit_detach" then
+        cfg.visual_clone_mode = "registered_player_material_lit_detach"
+        save_cfg()
+        local refs = get_local_player_refs()
+        ok, message = run_visual_mesh_clone_probe(refs)
+    elseif action == "spawn_visual_mesh_clone_registered_material_lit_scene_detach" then
+        cfg.visual_clone_mode = "registered_player_material_lit_scene_detach"
+        save_cfg()
+        local refs = get_local_player_refs()
+        ok, message = run_visual_mesh_clone_probe(refs)
+    elseif action == "spawn_visual_mesh_clone_registered_material_lit_owned_anchor_detach" then
+        cfg.visual_clone_mode = "registered_player_material_lit_owned_anchor_detach"
+        save_cfg()
+        local refs = get_local_player_refs()
+        ok, message = run_visual_mesh_clone_probe(refs)
+    elseif action == "spawn_visual_mesh_clone_registered_own_player_controller_lit" then
+        cfg.visual_clone_mode = "registered_own_player_controller_lit"
+        save_cfg()
+        local refs = get_local_player_refs()
+        ok, message = run_visual_mesh_clone_probe(refs)
+    elseif action == "spawn_visual_mesh_clone_registered_own_player_controller_independent_lit" then
+        cfg.visual_clone_mode = "registered_own_player_controller_independent_lit"
+        save_cfg()
+        local refs = get_local_player_refs()
+        ok, message = run_visual_mesh_clone_probe(refs)
+    elseif action == "spawn_visual_mesh_clone_registered_player_controller_independent_lit" then
+        cfg.visual_clone_mode = "registered_player_controller_independent_lit"
+        save_cfg()
+        local refs = get_local_player_refs()
+        ok, message = run_visual_mesh_clone_probe(refs)
     elseif action == "spawn_empty_context" then
         ok = false
         message = "disabled: empty ContextID can pollute runtime state; use spawn_new_context"
@@ -4469,6 +7381,10 @@ local function poll_dev_command()
         ok, message = run_controller_grace_spawn_probe()
     elseif action == "spawn_load_order_grace" then
         ok, message = run_player_load_order_grace_probe()
+    elseif action == "spawn_trace_order_controller_grace" then
+        ok, message = re9mp_run_trace_order_controller_spawn_probe()
+    elseif action == "raw_gameobject_clone_probe" then
+        ok, message = re9mp_run_raw_gameobject_clone_probe()
     elseif action == "context_create_probe" then
         ok, message = run_context_create_probe()
     elseif action == "set_prefab" then
@@ -4508,6 +7424,8 @@ end
 local function apply_remote_pose()
     local pose = current_remote_pose()
     if not pose or not pose.valid then return end
+
+    if update_visual_clone_pose(pose) then return end
 
     if not state.puppet_xform or not is_valid_managed(state.puppet_xform) then return end
 
@@ -4803,6 +7721,49 @@ local function draw_main_window()
     if imgui.button("Probe Grace Visual Mesh") then
         run_visual_component_probe()
     end
+    imgui.same_line()
+    if imgui.button("Probe Mesh Registration") then
+        run_mesh_registration_probe()
+    end
+    imgui.same_line()
+    if imgui.button("Spawn Visual Mesh Clone") then
+        local refs = get_local_player_refs()
+        run_visual_mesh_clone_probe(refs)
+    end
+    imgui.same_line()
+    if imgui.button("Spawn Force Visible Mesh") then
+        cfg.visual_clone_mode = "force_visible"
+        save_cfg()
+        local refs = get_local_player_refs()
+        run_visual_mesh_clone_probe(refs)
+    end
+    imgui.same_line()
+    if imgui.button("Spawn Force Static Mesh") then
+        cfg.visual_clone_mode = "force_static"
+        save_cfg()
+        local refs = get_local_player_refs()
+        run_visual_mesh_clone_probe(refs)
+    end
+    if imgui.button("Spawn Registered Mesh") then
+        cfg.visual_clone_mode = "registered_player_controller"
+        save_cfg()
+        local refs = get_local_player_refs()
+        run_visual_mesh_clone_probe(refs)
+    end
+    imgui.same_line()
+    if imgui.button("Spawn Registered Child") then
+        cfg.visual_clone_mode = "registered_player_child"
+        save_cfg()
+        local refs = get_local_player_refs()
+        run_visual_mesh_clone_probe(refs)
+    end
+    imgui.same_line()
+    if imgui.button("Spawn Child Material") then
+        cfg.visual_clone_mode = "registered_player_child_material"
+        save_cfg()
+        local refs = get_local_player_refs()
+        run_visual_mesh_clone_probe(refs)
+    end
     if imgui.button("Probe Grace Prefab/Clone") then
         try_spawn_puppet(false)
     end
@@ -4834,9 +7795,16 @@ local function draw_main_window()
     imgui.text("Level trace: " .. safe_string(state.level_trace_status))
     imgui.text("Pool trace: " .. safe_string(state.pool_trace_status))
     imgui.text("Bind trace: " .. safe_string(state.bind_trace_status))
+    imgui.text("Load injection: " .. safe_string(state.load_phase_injection_status))
+    if imgui.button("Install Spawn Hooks") then
+        state.spawn_hook_enabled = true
+        install_spawn_observer_hooks()
+        dump_spawn_hook_log(true)
+    end
     local trace_changed, trace_enabled = imgui.checkbox("Record level-load trace", state.level_trace_enabled)
     if trace_changed then
         state.level_trace_enabled = trace_enabled
+        state.spawn_hook_enabled = trace_enabled
         cfg.level_trace_enabled = trace_enabled
         save_cfg()
         if trace_enabled then
@@ -4848,6 +7816,7 @@ local function draw_main_window()
     end
     if imgui.button("Reset Level Trace") then
         state.level_trace_enabled = true
+        state.spawn_hook_enabled = true
         cfg.level_trace_enabled = true
         save_cfg()
         reset_level_trace("ui reset")
@@ -4892,8 +7861,12 @@ end
 
 re.on_frame(function()
     local t = now()
-    install_spawn_observer_hooks()
-    install_bind_trace_hooks()
+    if state.spawn_hook_enabled or state.level_trace_enabled then
+        install_spawn_observer_hooks()
+    end
+    if state.bind_trace_enabled then
+        install_bind_trace_hooks()
+    end
     if state.level_trace_enabled then
         local scene = get_current_scene()
         if scene ~= state.level_trace_last_scene then
@@ -4928,6 +7901,7 @@ re.on_frame(function()
         state.last_dev_poll = t
     end
     restore_controller_fields_if_due(false)
+    re9mp_poll_load_phase_player_clone_injection()
     update_local_dummy()
     if cfg.auto_runtime_diagnostics and state.local_ok then
         dump_runtime_diagnostics()
