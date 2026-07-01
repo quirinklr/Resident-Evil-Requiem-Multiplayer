@@ -4655,6 +4655,8 @@ function re9mp_dump_load_phase_injection_probe(reason)
             mode = safe_string(state.load_phase_injection_mode),
             status = safe_string(state.load_phase_injection_status),
             context = safe_string(state.load_phase_injection_context_text),
+            context_ref_source = safe_string(state.load_phase_injection_context_ref_source),
+            request_spawn_ok = state.load_phase_injection_request_spawn_ok and true or false,
             lines = state.load_phase_injection_lines or {},
         },
         character_manager = {},
@@ -4693,6 +4695,21 @@ function re9mp_dump_load_phase_injection_probe(reason)
 
         local ctx = state.load_phase_injection_context
         if ctx then
+            report.injected_context.lookups = {}
+            for _, call_name in ipairs({
+                "getContextRef(app.ContextID)",
+                "getPlayerContextRef(app.ContextID)",
+                "getSpawnDataRef(app.ContextID)",
+                "isUsedContext(app.ContextID)",
+                "isReservedContext(app.ContextID)",
+            }) do
+                local ok_lookup, result_lookup = pcall(function()
+                    return char_mgr:call(call_name, ctx)
+                end)
+                report.injected_context.lookups[call_name] = ok_lookup
+                    and probe_summary_text(result_lookup)
+                    or ("ERR " .. safe_string(result_lookup))
+            end
             local context_ref = nil
             for _, call_name in ipairs({"getContextRef(app.ContextID)", "getContextRef"}) do
                 local ok_ref, result = pcall(function()
@@ -4733,6 +4750,10 @@ function re9mp_dump_load_phase_injection_probe(reason)
     if refs and refs.valid then
         report.local_player_refs = {
             player = safe_string(refs.player),
+            context_id = safe_string(re9mp_trace_value(refs.player, {"get_ContextID"}, {
+                "_ContextID",
+                "<ContextID>k__BackingField",
+            })),
             game_object = safe_string(refs.go),
             game_object_name = safe_string(trace_call(refs.go, "get_Name")),
             transform = safe_string(refs.xform),
@@ -4745,6 +4766,29 @@ function re9mp_dump_load_phase_injection_probe(reason)
 
     pcall(function() json.dump_file(DATA_PREFIX .. "load_phase_injection_probe.json", report) end)
     return true, "load-phase injection probe dumped: " .. safe_string(state.load_phase_injection_status)
+end
+
+function re9mp_append_load_phase_context_lookup_summary(lines, char_mgr, ctx, kind_grace, label)
+    if not char_mgr or not ctx then
+        table.insert(lines, safe_string(label) .. " skipped: char_mgr/ctx nil")
+        return
+    end
+    for _, call_name in ipairs({
+        "getContextRef(app.ContextID)",
+        "getPlayerContextRef(app.ContextID)",
+        "getSpawnDataRef(app.ContextID)",
+        "isUsedContext(app.ContextID)",
+        "isReservedContext(app.ContextID)",
+    }) do
+        local ok_lookup, result_lookup = pcall(function()
+            return char_mgr:call(call_name, ctx)
+        end)
+        table.insert(lines, safe_string(label) .. " " .. call_name .. " -> "
+            .. (ok_lookup and probe_summary_text(result_lookup) or ("ERR " .. safe_string(result_lookup))))
+    end
+    if kind_grace then
+        re9mp_append_player_context_id_query(lines, char_mgr, kind_grace, safe_string(label) .. " playerContextID")
+    end
 end
 
 function re9mp_context_reserver_type_names()
@@ -5100,6 +5144,8 @@ function re9mp_maybe_run_load_phase_player_clone_injection(control, source_setti
         state.last_spawn_context = ctx
         pcall(function() state.load_phase_injection_context_text = safe_string(ctx:call("ToString")) end)
         state.last_spawn_context_text = state.load_phase_injection_context_text
+        state.load_phase_injection_context_ref_source = ""
+        state.load_phase_injection_request_spawn_ok = false
 
         local mode = safe_string(state.load_phase_injection_mode)
         local use_holder_register = mode == "holder_register_setup_create" or mode == "holder_swap_setup_create"
@@ -5246,13 +5292,18 @@ function re9mp_maybe_run_load_phase_player_clone_injection(control, source_setti
             table.insert(lines, call_name .. "(load-phase after setup) -> " .. (ok_ref and safe_string(result) or ("ERR " .. safe_string(result))))
             if ok_ref and result and not context_ref then
                 context_ref = result
+                state.load_phase_injection_context_ref_source = call_name .. " after setup"
                 pcall(function() context_ref = context_ref:add_ref() end)
             end
         end
         if not context_ref then
             context_ref = find_pending_player_context(char_mgr, lines)
             table.insert(lines, "pending PlayerContext fallback -> " .. safe_string(context_ref))
+            if context_ref then
+                state.load_phase_injection_context_ref_source = "pending PlayerContext fallback"
+            end
         end
+        re9mp_append_load_phase_context_lookup_summary(lines, char_mgr, ctx, kind_grace, "after_setup_lookup")
 
         if context_ref and mode ~= "setup_only" then
             local ok_common, err_common = pcall(function()
@@ -5277,8 +5328,10 @@ function re9mp_maybe_run_load_phase_player_clone_injection(control, source_setti
                     purpose_default
                 )
             end)
+            state.load_phase_injection_request_spawn_ok = ok_spawn and true or false
             table.insert(lines, "CharacterManager:requestSpawn(load-phase ctx) -> "
                 .. (ok_spawn and "ok" or ("ERR " .. safe_string(err_spawn))))
+            re9mp_append_load_phase_context_lookup_summary(lines, char_mgr, ctx, kind_grace, "after_requestSpawn_lookup")
         elseif mode == "setup_create" or mode == "holder_register_setup_create" or mode == "holder_swap_setup_create" or mode == "create" or mode == "full" then
             local ok_create, err_create = pcall(function()
                 control:call("createControlCharacter()")
@@ -5296,6 +5349,7 @@ function re9mp_maybe_run_load_phase_player_clone_injection(control, source_setti
             table.insert(lines, call_name .. "(load-phase after create) -> " .. (ok_ref and safe_string(result) or ("ERR " .. safe_string(result))))
             if ok_ref and result and not context_ref then
                 context_ref = result
+                state.load_phase_injection_context_ref_source = call_name .. " after create/requestSpawn"
                 pcall(function() context_ref = context_ref:add_ref() end)
             end
         end
@@ -5344,7 +5398,8 @@ function re9mp_maybe_run_load_phase_player_clone_injection(control, source_setti
         if old_init_suspended ~= nil then pcall(function() control:set_field("_InitStateSuspended", old_init_suspended) end) end
 
         state.load_phase_injection_status = context_ref
-            and ("triggered; context=" .. safe_string(state.load_phase_injection_context_text))
+            and ("triggered; context=" .. safe_string(state.load_phase_injection_context_text)
+                .. " source=" .. safe_string(state.load_phase_injection_context_ref_source))
             or ("triggered; no context=" .. safe_string(state.load_phase_injection_context_text))
         state.character_spawn_status = "load-phase injection " .. state.load_phase_injection_status
         state.puppet_status = state.character_spawn_status
@@ -5403,6 +5458,8 @@ function re9mp_arm_load_phase_player_clone_injection(mode)
     state.load_phase_injection_pre_lines = {}
     state.load_phase_injection_followup_until = 0
     state.load_phase_injection_next_dump = 0
+    state.load_phase_injection_context_ref_source = ""
+    state.load_phase_injection_request_spawn_ok = false
 
     state.level_trace_enabled = true
     state.pool_trace_enabled = true
