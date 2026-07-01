@@ -629,7 +629,7 @@ local function reset_level_trace(reason)
     state.level_trace_status = "recording: " .. safe_string(reason or "manual")
 end
 
-local function push_level_trace_event(method_name, args, phase, retval)
+local function push_level_trace_event(method_name, args, phase, retval, max_args)
     if not state.level_trace_enabled then return end
     local event = {
         time_ms = now_ms(),
@@ -640,7 +640,8 @@ local function push_level_trace_event(method_name, args, phase, retval)
         args = {},
     }
     if args then
-        for i = 1, 10 do
+        local limit = max_args or 2
+        for i = 2, limit do
             local arg = args[i]
             if arg == nil then break end
             event.args[i] = describe_hook_arg(arg)
@@ -689,14 +690,15 @@ local function dump_level_trace(force)
     end)
 end
 
-local function push_spawn_hook_event(method_name, args)
+local function push_spawn_hook_event(method_name, args, max_args)
     local event = {
         time_ms = now_ms(),
         scene = get_current_scene(),
         method = method_name,
         args = {},
     }
-    for i = 1, 10 do
+    local limit = max_args or 2
+    for i = 2, limit do
         local arg = args[i]
         if arg == nil then break end
         event.args[i] = describe_hook_arg(arg)
@@ -758,14 +760,19 @@ local function install_spawn_observer_hooks()
             local name = method:get_name()
             if observe[name] then
                 local label = name
+                local arg_limit = 2
                 pcall(function() label = method_signature(method) end)
+                pcall(function()
+                    local param_types = method:get_param_types()
+                    arg_limit = (param_types and #param_types or 0) + 2
+                end)
                 sdk.hook(method, function(args)
-                    pcall(function() push_spawn_hook_event(label, args) end)
-                    pcall(function() push_level_trace_event(label, args, "pre", nil) end)
+                    pcall(function() push_spawn_hook_event(label, args, arg_limit) end)
+                    pcall(function() push_level_trace_event(label, args, "pre", nil, arg_limit) end)
                 end, function(retval)
                     pcall(function()
                         if name == "readyContext" or name == "restoreContext" or name == "getCharacterContextFactory" then
-                            push_level_trace_event(label, nil, "post", retval)
+                            push_level_trace_event(label, nil, "post", retval, 0)
                         end
                     end)
                     return retval
