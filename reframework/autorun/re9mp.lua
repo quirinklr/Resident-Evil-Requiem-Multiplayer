@@ -1513,6 +1513,40 @@ local function append_player_context_deep_summary(lines, label, player_context)
     end
 end
 
+local function append_spawn_data_deep_summary(lines, label, spawn_data)
+    if not spawn_data then return end
+    table.insert(lines, label .. " deep=" .. safe_string(spawn_data))
+    for _, line in ipairs(object_all_field_summary(label, spawn_data, 80)) do
+        table.insert(lines, line)
+    end
+    for _, line in ipairs(object_method_summary(label, spawn_data, {
+        "Context", "Kind", "Spawn", "Control", "Group", "Setting", "Transform", "Position", "Rotation", "Resume", "Duplicate", "Owner",
+    }, 100)) do
+        table.insert(lines, line)
+    end
+
+    for _, field_name in ipairs({
+        "<SpawnControl>k__BackingField",
+        "<SpawnGroup>k__BackingField",
+        "_CharacterSettings",
+        "<ContextID>k__BackingField",
+        "<KindID>k__BackingField",
+    }) do
+        local value = nil
+        pcall(function() value = spawn_data:get_field(field_name) end)
+        local nested_label = label .. "." .. field_name
+        table.insert(lines, nested_label .. "=" .. safe_string(value))
+        for _, line in ipairs(object_all_field_summary(nested_label, value, 80)) do
+            table.insert(lines, line)
+        end
+        for _, line in ipairs(object_method_summary(nested_label, value, {
+            "Context", "Kind", "Spawn", "Control", "Group", "Owner", "Request", "Execute", "Create", "Setup", "Initialize", "Update", "Enable",
+        }, 120)) do
+            table.insert(lines, line)
+        end
+    end
+end
+
 local function run_character_object_probe()
     local refs = get_local_player_refs()
     if refs.valid and refs.go then
@@ -1582,6 +1616,14 @@ local function run_character_object_probe()
                     end
                 end
             end
+            local ok_last_spawn_data, last_spawn_data = pcall(function()
+                return char_mgr:call("getSpawnDataRef(app.ContextID)", state.last_spawn_context)
+                    or char_mgr:call("getSpawnDataRef", state.last_spawn_context)
+            end)
+            table.insert(lines, "LastSpawnContext.SpawnDataDeep -> " .. (ok_last_spawn_data and safe_string(last_spawn_data) or ("ERR " .. safe_string(last_spawn_data))))
+            if ok_last_spawn_data and last_spawn_data then
+                append_spawn_data_deep_summary(lines, "SpawnData.LastSpawnContext", last_spawn_data)
+            end
         end
 
         table.insert(lines, "CharacterManager methods: " .. table.concat(collect_methods_from_type("app.CharacterManager", {"Player", "Context", "Spawn", "Montage", "Owner"}, 120), ", "))
@@ -1639,6 +1681,7 @@ local function run_character_object_probe()
                 for _, line in ipairs(object_all_field_summary("SpawnData.Player.cp_A100", result, 80)) do
                     table.insert(lines, line)
                 end
+                append_spawn_data_deep_summary(lines, "SpawnData.Player.cp_A100.Deep", result)
                 for _, line in ipairs(object_all_method_summary("SpawnData.Player.cp_A100", result, 80)) do
                     table.insert(lines, line)
                 end
