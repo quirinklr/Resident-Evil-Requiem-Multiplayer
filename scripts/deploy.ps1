@@ -7,6 +7,9 @@ $ErrorActionPreference = "Stop"
 
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $game = Resolve-Path $GameDir
+
+& (Join-Path $PSScriptRoot "build_lua_bundle.ps1") -Root $root
+
 $pluginSrc = Join-Path $BuildDir "bin\Release\re9mp.dll"
 if (-not (Test-Path $pluginSrc)) {
     $pluginSrc = Join-Path $BuildDir "bin\re9mp.dll"

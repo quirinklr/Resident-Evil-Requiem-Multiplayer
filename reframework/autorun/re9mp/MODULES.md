@@ -4,13 +4,15 @@ This folder is the new home for RE9MP Lua runtime code.
 
 Current migration status:
 
-- `init.lua` is the runtime entrypoint loaded by `../re9mp.lua`.
-- `legacy_runtime.lua` concatenates the extracted legacy chunks and executes them as one Lua chunk, preserving old top-level `local` scope.
+- `../re9mp.lua` is a generated runtime bundle built by `scripts/build_lua_bundle.ps1`.
+- `init.lua` and `legacy_runtime.lua` are transitional loader references, not the active REFramework autorun path.
+- The generated bundle concatenates the extracted legacy chunks and executes them as one Lua chunk, preserving old top-level `local` scope.
 - `core/`, `runtime/`, `spawn/`, `tracing/`, and `archive/` are the target folders for the cleanup.
 
 Extraction rule:
 
-- Move one subsystem at a time out of `legacy_runtime.lua`.
+- Move one subsystem at a time out of the legacy chunks.
+- Rebuild `../re9mp.lua` with `scripts/build_lua_bundle.ps1` after chunk edits.
 - Keep active commands reload-safe after every extraction.
 - Archive negative experiments instead of leaving them in normal command flow.
 

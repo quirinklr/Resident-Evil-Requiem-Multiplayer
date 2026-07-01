@@ -25,10 +25,8 @@ end
 
 local function load_legacy_runtime()
     local dir = script_dir()
-    local game_module = "C:/Program Files (x86)/Steam/steamapps/common/RESIDENT EVIL requiem BIOHAZARD requiem/reframework/autorun/re9mp/"
     local candidates = {
         dir .. "legacy_runtime.lua",
-        game_module .. "legacy_runtime.lua",
         "reframework/autorun/re9mp/legacy_runtime.lua",
         "autorun/re9mp/legacy_runtime.lua",
         "re9mp/legacy_runtime.lua",
