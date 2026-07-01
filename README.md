@@ -1,3 +1,25 @@
+# RE9MP Progress Tracker
+
+Last updated: 2026-07-01 08:40 CEST
+
+Current target progress:
+
+- Goal 1, local visible Grace clone: 55%
+- Goal 2, networked Grace clone: 45%
+
+Why this percentage:
+
+- 2026-07-01 08:40 CEST: Goal 1 raised to 55% because the local player, scene, `Cp_A100Updater`, `PlayerMeshController`, `ActorPlayerMeshController`, and 14 live `app.MeshUnit` entries are now confirmed. Each MeshUnit exposes a real `via.GameObject` and `via.render.Mesh`, so the next local-spawn path is visual cloning/instancing of Grace mesh units instead of duplicating `PlayerContext`. It is not higher because no second visible Grace has spawned yet.
+- 2026-07-01 08:40 CEST: Goal 2 remains 45% because host/client Tailscale UDP, scene/build handshake, movement snapshots, ping, and remote transform math already worked in a two-PC test. It is blocked behind Goal 1 because the network can move a remote pose, but there is still no local visual Grace puppet to attach that pose to.
+
+How this tracker is maintained:
+
+- Only update percentages after a concrete in-game test, generated diagnostic JSON, or code change proves new capability.
+- Every percentage change must add one short dated reason under `Why this percentage`.
+- Goal 1 measures: spawn or construct a second visible Grace locally, then move/despawn it safely.
+- Goal 2 measures: drive that local Grace puppet from remote network snapshots over Tailscale.
+- Failed paths stay documented in `docs/REVERSE_ENGINEERING_MEMORY.md` so the same dead end is not retried later.
+
 # RE9 Multiplayer MVP
 
 This repository contains a REFramework-based multiplayer prototype for Resident Evil Requiem.

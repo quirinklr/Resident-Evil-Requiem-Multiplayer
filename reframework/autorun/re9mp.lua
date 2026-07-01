@@ -11,7 +11,10 @@ local DEV_RESULT_FILE = DATA_PREFIX .. "dev_result.json"
 local SPAWN_HOOK_FILE = DATA_PREFIX .. "spawn_hook_log.json"
 local LEVEL_TRACE_FILE = DATA_PREFIX .. "level_load_trace.json"
 local POOL_TRACE_FILE = DATA_PREFIX .. "pool_trace.json"
+local BIND_TRACE_FILE = DATA_PREFIX .. "bind_trace.json"
 local RESOURCE_PROBE_FILE = DATA_PREFIX .. "resource_probe.json"
+local COMPONENT_RESOURCE_PROBE_FILE = DATA_PREFIX .. "component_resource_probe.json"
+local VISUAL_COMPONENT_PROBE_FILE = DATA_PREFIX .. "visual_component_probe.json"
 local LOCAL_FILE = DATA_PREFIX .. "local_snapshot.json"
 local STATUS_FILE = DATA_PREFIX .. "status.json"
 local REMOTE_FILE = DATA_PREFIX .. "remote_snapshot.json"
@@ -28,6 +31,7 @@ local cfg = {
     level_trace_enabled = false,
     controller_trace_enabled = false,
     pool_trace_enabled = false,
+    bind_trace_enabled = false,
 }
 
 pcall(function()
@@ -121,7 +125,16 @@ local state = {
     pool_trace_last_sample = 0,
     pool_trace_last_scene = "",
     pool_trace_last_signature = "",
+    bind_trace_enabled = cfg.bind_trace_enabled and true or false,
+    bind_trace_attempted = false,
+    bind_trace_status = "waiting",
+    bind_trace_events = {},
+    bind_trace_dirty = false,
+    bind_trace_started_ms = 0,
+    bind_trace_last_dump = 0,
     resource_probe_status = "",
+    component_resource_status = "",
+    visual_probe_status = "",
     character_object_probe = "",
     last_spawn_context = nil,
     last_spawn_context_text = "",
@@ -601,6 +614,17 @@ local function collect_method_signatures()
     state.method_signatures = table.concat(lines, "\n")
 end
 
+local function hook_parent_type_definition(td)
+    if not td then return nil end
+    local parent = nil
+    local ok_parent = pcall(function() parent = td:get_parent_type() end)
+    if not ok_parent or not parent then
+        ok_parent = pcall(function() parent = td:get_parent_type_definition() end)
+    end
+    if not ok_parent then return nil end
+    return parent
+end
+
 local function describe_hook_arg(arg)
     local out = {}
     pcall(function() out.i64 = safe_string(sdk.to_int64(arg)) end)
@@ -631,30 +655,44 @@ local function describe_hook_arg(arg)
 
             out.fields = {}
             local n = 0
-            for _, field in ipairs(td:get_fields()) do
-                local name = field:get_name() or ""
-                local ftype = field:get_type()
-                local field_type = ftype and ftype:get_full_name() or ""
-                local interesting = name:find("Context") or name:find("Kind") or name:find("Spawn")
-                    or name:find("Montage") or name:find("Purpose") or name:find("GameObject")
-                    or name:find("Transform") or name:find("Player") or name:find("Create")
-                    or name:find("Setting") or name:find("Default") or name:find("Init")
-                    or name:find("Enable") or name:find("Pose") or name:find("Position")
-                    or name:find("Rotation") or name:find("Chapter") or name:find("Message")
-                    or name:find("Prefab") or name:find("Resource") or name:find("Path")
-                    or field_type:find("Context") or field_type:find("Kind")
-                    or field_type:find("CreateSetting") or field_type:find("Spawn")
-                if interesting then
-                    local value = nil
-                    pcall(function() value = obj:get_field(name) end)
-                    table.insert(out.fields, {
-                        name = name,
-                        type = field_type,
-                        value = safe_string(value),
-                    })
-                    n = n + 1
-                    if n >= 40 then break end
+            local depth = 0
+            local seen = {}
+            local include_all_spawn_fields = type_name:find("SpawnData") ~= nil
+            while td and depth < 8 and n < 80 do
+                local level_name = td:get_full_name() or "?"
+                if seen[level_name] then break end
+                seen[level_name] = true
+
+                for _, field in ipairs(td:get_fields()) do
+                    local name = field:get_name() or ""
+                    local ftype = field:get_type()
+                    local field_type = ftype and ftype:get_full_name() or ""
+                    local interesting = include_all_spawn_fields
+                        or name:find("Context") or name:find("Kind") or name:find("Spawn")
+                        or name:find("Montage") or name:find("Purpose") or name:find("GameObject")
+                        or name:find("Transform") or name:find("Player") or name:find("Create")
+                        or name:find("Setting") or name:find("Default") or name:find("Init")
+                        or name:find("Enable") or name:find("Pose") or name:find("Position")
+                        or name:find("Rotation") or name:find("Chapter") or name:find("Message")
+                        or name:find("Prefab") or name:find("Resource") or name:find("Path")
+                        or field_type:find("Context") or field_type:find("Kind")
+                        or field_type:find("CreateSetting") or field_type:find("Spawn")
+                    if interesting then
+                        local value = nil
+                        pcall(function() value = obj:get_field(name) end)
+                        table.insert(out.fields, {
+                            declaring_type = level_name,
+                            name = name,
+                            type = field_type,
+                            value = safe_string(value),
+                        })
+                        n = n + 1
+                        if n >= 80 then break end
+                    end
                 end
+
+                td = hook_parent_type_definition(td)
+                depth = depth + 1
             end
         end)
     end)
@@ -926,6 +964,174 @@ local function dump_pool_trace(force)
     end)
 end
 
+local function reset_bind_trace(reason)
+    state.bind_trace_events = {}
+    state.bind_trace_dirty = true
+    state.bind_trace_started_ms = now_ms()
+    state.bind_trace_status = "recording: " .. safe_string(reason or "manual")
+end
+
+local function describe_bind_object(obj)
+    local row = {
+        ref = safe_string(obj),
+        type = trace_type_name(obj),
+    }
+    if not obj then return row end
+
+    if row.type:find("CharacterPoolInfo", 1, true) then
+        row.pool = trace_pool_summary(obj, -1)
+    elseif row.type:find("Updater", 1, true) then
+        row.game_object = safe_string(trace_call(obj, "get_GameObject"))
+        row.transform = safe_string(trace_call(obj, "get_Transform"))
+        row.context = safe_string(trace_call(obj, "get_Context"))
+        row.owner = safe_string(trace_call(obj, "get_Owner"))
+    elseif row.type:find("CharacterContext", 1, true) or row.type:find("PlayerContext", 1, true) then
+        row.context_summary = trace_context_summary(obj, -1)
+    end
+
+    return row
+end
+
+local function push_bind_trace_event(method_name, args, max_args)
+    if not state.bind_trace_enabled then return end
+
+    local event = {
+        time_ms = now_ms(),
+        dt_ms = math.max(0, now_ms() - (state.bind_trace_started_ms or 0)),
+        scene = get_current_scene(),
+        method = method_name,
+        args = {},
+        counts = {},
+    }
+
+    pcall(function()
+        local char_mgr = sdk.get_managed_singleton("app.CharacterManager")
+        if not char_mgr then return end
+
+        local player_list = nil
+        local pool_list = nil
+        local spawn_data_db = nil
+        local context_db = nil
+        pcall(function() player_list = char_mgr:get_field("<PlayerContextList>k__BackingField") end)
+        pcall(function() pool_list = char_mgr:get_field("<CharacterPool>k__BackingField") end)
+        pcall(function() spawn_data_db = char_mgr:get_field("<CharacterSpawnDataDB>k__BackingField") end)
+        pcall(function() context_db = char_mgr:get_field("<CharacterContextDB>k__BackingField") end)
+
+        event.counts.player_contexts = trace_count(player_list)
+        event.counts.character_pool = trace_count(pool_list)
+        event.counts.spawn_data_db = trace_count(spawn_data_db)
+        event.counts.context_db = trace_count(context_db)
+    end)
+
+    local limit = max_args or 2
+    for i = 2, limit do
+        local raw = args and args[i]
+        if raw == nil then break end
+
+        local arg = {
+            slot = i,
+            i64 = "",
+        }
+        pcall(function() arg.i64 = safe_string(sdk.to_int64(raw)) end)
+        pcall(function()
+            local obj = sdk.to_managed_object(raw)
+            if obj then
+                arg.object = describe_bind_object(obj)
+            end
+        end)
+        table.insert(event.args, arg)
+    end
+
+    table.insert(state.bind_trace_events, event)
+    while #state.bind_trace_events > 1500 do
+        table.remove(state.bind_trace_events, 1)
+    end
+    state.bind_trace_dirty = true
+    state.bind_trace_status = "recording events=" .. tostring(#state.bind_trace_events)
+end
+
+local function dump_bind_trace(force)
+    if not force and not state.bind_trace_dirty then return end
+    state.bind_trace_dirty = false
+    pcall(function()
+        json.dump_file(BIND_TRACE_FILE, {
+            time_ms = now_ms(),
+            active = state.bind_trace_enabled,
+            status = state.bind_trace_status,
+            scene = get_current_scene(),
+            started_ms = state.bind_trace_started_ms,
+            events = state.bind_trace_events,
+        })
+    end)
+end
+
+local function install_bind_trace_hooks()
+    if state.bind_trace_attempted then return end
+    state.bind_trace_attempted = true
+
+    local ok, err = pcall(function()
+        local installed = 0
+        local targets = {
+            {"app.CharacterPoolInfo", {
+                set_GameObjectFinalized = true,
+                set_Updater = true,
+                set_Reserved = true,
+                set_Used = true,
+            }},
+            {"app.PlayerContext", {
+                set_Updater = true,
+                onCreateContext = true,
+            }},
+            {"app.CharacterUpdaterBase", {
+                set_Context = true,
+                set_Owner = true,
+            }},
+            {"app.PlayerUpdaterBase", {
+                set_Context = true,
+                set_Owner = true,
+            }},
+            {"app.Cp_A100Updater", {
+                set_Context = true,
+                set_Owner = true,
+            }},
+        }
+
+        for _, target in ipairs(targets) do
+            local type_name = target[1]
+            local observe = target[2]
+            local td = sdk.find_type_definition(type_name)
+            if td then
+                for _, method in ipairs(td:get_methods()) do
+                    local name = method:get_name()
+                    if observe[name] then
+                        local label = type_name .. "." .. name
+                        local arg_limit = 2
+                        pcall(function() label = type_name .. "." .. method_signature(method) end)
+                        pcall(function()
+                            local param_types = method:get_param_types()
+                            arg_limit = (param_types and #param_types or 0) + 2
+                        end)
+                        sdk.hook(method, function(args)
+                            pcall(function() push_bind_trace_event(label, args, arg_limit) end)
+                        end, function(retval)
+                            return retval
+                        end)
+                        installed = installed + 1
+                    end
+                end
+            end
+        end
+
+        state.bind_trace_status = "installed " .. tostring(installed) .. " bind hooks"
+        dump_bind_trace(true)
+    end)
+
+    if not ok then
+        state.bind_trace_status = "hook install failed: " .. safe_string(err)
+        dump_bind_trace(true)
+    end
+end
+
 local function push_spawn_hook_event(method_name, args, max_args)
     local event = {
         time_ms = now_ms(),
@@ -940,7 +1146,7 @@ local function push_spawn_hook_event(method_name, args, max_args)
         event.args[i] = describe_hook_arg(arg)
     end
     table.insert(state.spawn_hook_events, event)
-    while #state.spawn_hook_events > 20 do
+    while #state.spawn_hook_events > 500 do
         table.remove(state.spawn_hook_events, 1)
     end
     state.spawn_hook_dirty = true
@@ -1188,6 +1394,20 @@ local DEFAULT_GRACE_PREFAB_PATHS = {
     "character/ch/ch01/0100/01/ch0100_01_102.pfb",
 }
 
+local DEFAULT_GRACE_RESOURCE_PATHS = {
+    "natives/stm/character/ch/ch01/0100/01/ch0100_01_000.pfb.18",
+    "natives/stm/character/ch/ch01/0100/01/ch0100_01_001.pfb.18",
+    "natives/stm/character/ch/ch01/0100/01/ch0100_01_010.pfb.18",
+    "natives/stm/character/ch/ch01/0100/01/ch0100_01_100.pfb.18",
+    "natives/stm/character/ch/ch01/0100/01/ch0100_01_102.pfb.18",
+    "natives/stm/character/ch/ch01/0100/01/00/ch0100_01_00.mesh.250925211",
+    "natives/stm/character/ch/ch01/0100/01/00/ch0100_01_00_00.mdf2.51",
+    "natives/stm/character/ch/ch01/0100/01/01/ch0100_01_01.mesh.250925211",
+    "natives/stm/character/ch/ch01/0100/01/01/ch0100_01_01_00.mdf2.51",
+    "natives/stm/animation/ch/ch01/ch0100/motbank/ch0100.motbank.4",
+    "natives/stm/animation/ch/ch01/ch0100/motbank/ch0100fps.motbank.4",
+}
+
 local function resource_path_variants(path)
     local variants = {}
     local function add(value)
@@ -1215,6 +1435,114 @@ local function resource_path_variants(path)
         add(tostring(variants[i]):lower())
     end
     return variants
+end
+
+local function generic_resource_path_variants(path)
+    local variants = {}
+    local function add(value)
+        if not value or value == "" then return end
+        value = tostring(value):gsub("\\", "/"):gsub("^%s+", ""):gsub("%s+$", "")
+        add_unique(variants, value, 48)
+    end
+
+    local raw = tostring(path or ""):gsub("\\", "/")
+    local no_native = raw:gsub("^natives/%w%w%w/", "")
+    local no_version = no_native:gsub("%.%d+%.x64$", ""):gsub("%.%d+$", "")
+
+    add(raw)
+    add(no_native)
+    add(no_version)
+    add("natives/stm/" .. no_version)
+    add("natives/stm/" .. no_native)
+
+    local lower_count = #variants
+    for i = 1, lower_count do
+        add(tostring(variants[i]):lower())
+    end
+    return variants
+end
+
+local function normalize_resource_path(text)
+    if not text or text == "" then return nil end
+    text = tostring(text):gsub("\\", "/")
+    for _, ext in ipairs({"pfb", "mesh", "mdf2", "motbank", "user", "chain", "rcol", "tex"}) do
+        local p = text:match("([%w_%-/%.]+%." .. ext .. "%.%d+)")
+        if p then return p:gsub("^natives/%w%w%w/", "") end
+        p = text:match("([%w_%-/%.]+%." .. ext .. ")")
+        if p then return p:gsub("^natives/%w%w%w/", "") end
+    end
+    return nil
+end
+
+local function resource_extension(path)
+    local lower = tostring(path or ""):lower()
+    for _, ext in ipairs({"pfb", "mesh", "mdf2", "motbank", "user", "chain", "rcol", "tex"}) do
+        if lower:find("%." .. ext, 1, false) then return ext end
+    end
+    return ""
+end
+
+local RESOURCE_TYPE_CANDIDATES = {
+    pfb = {"via.Prefab"},
+    mesh = {"via.render.Mesh", "via.render.MeshResource"},
+    mdf2 = {"via.render.Material", "via.render.MaterialResource"},
+    motbank = {"via.motion.MotionBank", "via.motion.MotionBankResource"},
+    user = {"via.UserData", "via.userdata.UserData"},
+    chain = {"via.physics.ChainResource", "via.ChainResource"},
+    rcol = {"via.physics.RcolResource", "via.physics.RCOLResource"},
+    tex = {"via.render.Texture", "via.render.TextureResource"},
+}
+
+local function try_create_resource_matrix(paths, max_paths)
+    local rows = {}
+    for _, input in ipairs(paths or {}) do
+        if #rows >= (max_paths or 12) then break end
+        local ext = resource_extension(input)
+        local type_candidates = RESOURCE_TYPE_CANDIDATES[ext] or {"via.Resource"}
+        local row = {
+            input = safe_string(input),
+            extension = ext,
+            ok = false,
+            found_type = "",
+            found_path = "",
+            attempts = {},
+        }
+        for _, type_name in ipairs(type_candidates) do
+            local type_exists = false
+            pcall(function() type_exists = sdk.find_type_definition(type_name) ~= nil end)
+            for _, candidate_path in ipairs(generic_resource_path_variants(input)) do
+                local attempt = {
+                    type = type_name,
+                    type_exists = type_exists,
+                    path = candidate_path,
+                    ok = false,
+                    error = type_exists and "" or "type not found",
+                }
+                if type_exists then
+                    local resource = nil
+                    local ok_create, err_create = pcall(function()
+                        resource = sdk.create_resource(type_name, candidate_path)
+                    end)
+                    attempt.ok = ok_create and resource ~= nil
+                    attempt.error = ok_create and (resource and "" or "nil") or safe_string(err_create)
+                    attempt.value = safe_string(resource)
+                    attempt.value_type = trace_type_name(resource)
+                    if attempt.ok then
+                        row.ok = true
+                        row.found_type = type_name
+                        row.found_path = candidate_path
+                        table.insert(row.attempts, attempt)
+                        break
+                    end
+                end
+                table.insert(row.attempts, attempt)
+                if #row.attempts >= 18 then break end
+            end
+            if row.ok or #row.attempts >= 18 then break end
+        end
+        table.insert(rows, row)
+    end
+    return rows
 end
 
 local function is_effect_prefab_path(path)
@@ -1534,6 +1862,21 @@ local function set_fields_by_type_or_name(obj, target_type_name, name_markers, v
     end)
     table.insert(lines, label .. " changed_fields=" .. tostring(changed))
     return changed
+end
+
+local function set_named_field_for_probe(obj, name, value, label, lines)
+    if not obj then
+        table.insert(lines, label .. " set " .. name .. " skipped: object nil")
+        return false
+    end
+
+    local before = nil
+    pcall(function() before = obj:get_field(name) end)
+    local ok_set, err_set = pcall(function() obj:set_field(name, value) end)
+    local after = nil
+    pcall(function() after = obj:get_field(name) end)
+    table.insert(lines, label .. " set " .. name .. " " .. safe_string(before) .. " -> " .. safe_string(after) .. " = " .. (ok_set and "ok" or ("ERR " .. safe_string(err_set))))
+    return ok_set
 end
 
 local function object_method_summary(label, obj, patterns, limit)
@@ -2092,6 +2435,413 @@ local function run_character_object_probe()
         })
     end)
     return true, spawn_data_status
+end
+
+local function is_resource_probe_name(name)
+    name = tostring(name or "")
+    return name:find("Prefab") or name:find("prefab")
+        or name:find("Resource") or name:find("resource")
+        or name:find("Mesh") or name:find("mesh")
+        or name:find("Material") or name:find("material")
+        or name:find("Motion") or name:find("motion")
+        or name:find("Bank") or name:find("bank")
+        or name:find("Model") or name:find("model")
+        or name:find("Path") or name:find("path")
+        or name:find("File") or name:find("file")
+        or name:find("ch0100") or name:find("A100")
+end
+
+local function value_resource_info(value)
+    local info = {
+        value = safe_string(value),
+        type = trace_type_name(value),
+        path = normalize_resource_path(safe_string(value)) or "",
+        text = "",
+    }
+    if value and (type(value) == "userdata" or type(value) == "table") then
+        for _, method_name in ipairs({"ToString", "get_Path", "get_FilePath", "get_Name", "get_ResourcePath"}) do
+            local ok, result = pcall(function()
+                if value.call then return value:call(method_name) end
+                return nil
+            end)
+            if ok and result then
+                local text = safe_string(result)
+                if info.text == "" then info.text = text end
+                local path = normalize_resource_path(text)
+                if path and info.path == "" then info.path = path end
+            end
+        end
+    end
+    return info
+end
+
+local function collect_resource_rows_from_object(label, obj, field_limit, method_limit)
+    local out = {
+        label = safe_string(label),
+        value = safe_string(obj),
+        type = trace_type_name(obj),
+        fields = {},
+        methods = {},
+    }
+    if not obj or not obj.get_type_definition then return out end
+
+    pcall(function()
+        local td = obj:get_type_definition()
+        local seen = {}
+        local depth = 0
+        while td and depth < 8 and #out.fields < (field_limit or 48) do
+            local declaring_type = td:get_full_name() or "?"
+            if seen[declaring_type] then break end
+            seen[declaring_type] = true
+            for _, field in ipairs(td:get_fields()) do
+                local field_name = field:get_name() or ""
+                local field_type = ""
+                pcall(function()
+                    local ftype = field:get_type()
+                    field_type = ftype and ftype:get_full_name() or ""
+                end)
+                if is_resource_probe_name(field_name) or is_resource_probe_name(field_type) then
+                    local value = nil
+                    pcall(function() value = obj:get_field(field_name) end)
+                    local info = value_resource_info(value)
+                    table.insert(out.fields, {
+                        declaring_type = declaring_type,
+                        name = field_name,
+                        type = field_type,
+                        value = info.value,
+                        value_type = info.type,
+                        text = info.text,
+                        path = info.path,
+                    })
+                end
+                if #out.fields >= (field_limit or 48) then break end
+            end
+            td = get_parent_type_definition(td)
+            depth = depth + 1
+        end
+    end)
+
+    pcall(function()
+        local td = obj:get_type_definition()
+        if not td then return end
+        for _, method in ipairs(td:get_methods()) do
+            if #out.methods >= (method_limit or 32) then break end
+            local name = method:get_name() or ""
+            local ret = method:get_return_type()
+            local ret_name = ret and ret:get_full_name() or ""
+            local params = 999
+            pcall(function() params = method:get_num_params() end)
+            local is_getter = name:find("get_", 1, true) == 1
+            local returns_value = ret_name ~= "" and ret_name ~= "System.Void"
+            if params == 0 and is_getter and returns_value
+                and (is_resource_probe_name(name) or is_resource_probe_name(ret_name)) then
+                local value = nil
+                local ok_call, err_call = pcall(function() value = obj:call(name) end)
+                local info = value_resource_info(value)
+                table.insert(out.methods, {
+                    signature = method_signature(method),
+                    ok = ok_call,
+                    error = ok_call and "" or safe_string(err_call),
+                    value = info.value,
+                    value_type = info.type,
+                    text = info.text,
+                    path = info.path,
+                })
+            end
+        end
+    end)
+
+    return out
+end
+
+local function component_type_is_grace_relevant(type_name)
+    type_name = tostring(type_name or "")
+    return type_name:find("A100")
+        or type_name:find("Player")
+        or type_name:find("Mesh")
+        or type_name:find("Motion")
+        or type_name:find("Render")
+        or type_name:find("Model")
+        or type_name:find("Material")
+        or type_name:find("Figure")
+        or type_name:find("Chara")
+        or type_name:find("Character")
+        or type_name:find("Costume")
+end
+
+local function run_component_resource_probe()
+    local refs = get_local_player_refs()
+    local report = {
+        time_ms = now_ms(),
+        scene = get_current_scene(),
+        local_player = refs.valid and true or false,
+        local_error = refs.error or "",
+        player = safe_string(refs.player),
+        player_go = safe_string(refs.go),
+        player_go_name = safe_string(refs.name),
+        objects = {},
+        component_names = {},
+        resource_load_attempts = try_create_resource_matrix(DEFAULT_GRACE_RESOURCE_PATHS, 12),
+    }
+
+    if not refs.valid or not refs.go then
+        state.component_resource_status = "failed: " .. safe_string(refs.error)
+        pcall(function() json.dump_file(COMPONENT_RESOURCE_PROBE_FILE, report) end)
+        return false, state.component_resource_status
+    end
+
+    table.insert(report.objects, collect_resource_rows_from_object("PlayerContext", refs.player, 48, 32))
+    table.insert(report.objects, collect_resource_rows_from_object("PlayerGameObject", refs.go, 48, 32))
+    local updater = nil
+    pcall(function() updater = refs.player:call("get_Updater") end)
+    table.insert(report.objects, collect_resource_rows_from_object("PlayerUpdater", updater, 64, 40))
+
+    pcall(function()
+        local components = refs.go:call("get_Components")
+        if not components then return end
+        local count = components:call("get_Count") or 0
+        report.component_count = count
+        local added = 0
+        for i = 0, math.min(count - 1, 120) do
+            pcall(function()
+                local comp = components:call("get_Item", i)
+                local type_name = trace_type_name(comp)
+                table.insert(report.component_names, { index = i, type = type_name, value = safe_string(comp) })
+                if component_type_is_grace_relevant(type_name) and added < 28 then
+                    table.insert(report.objects, collect_resource_rows_from_object("Component[" .. tostring(i) .. "] " .. type_name, comp, 40, 28))
+                    added = added + 1
+                end
+            end)
+        end
+        report.relevant_component_objects = added
+    end)
+
+    local path_hits = {}
+    for _, obj in ipairs(report.objects) do
+        for _, field in ipairs(obj.fields or {}) do
+            add_unique(path_hits, field.path, 80)
+        end
+        for _, method in ipairs(obj.methods or {}) do
+            add_unique(path_hits, method.path, 80)
+        end
+    end
+    report.path_hits = path_hits
+
+    local load_ok = 0
+    for _, row in ipairs(report.resource_load_attempts or {}) do
+        if row.ok then load_ok = load_ok + 1 end
+    end
+    state.component_resource_status = "dumped objects=" .. tostring(#report.objects)
+        .. " components=" .. tostring(#report.component_names)
+        .. " path_hits=" .. tostring(#path_hits)
+        .. " resource_ok=" .. tostring(load_ok)
+    pcall(function() json.dump_file(COMPONENT_RESOURCE_PROBE_FILE, report) end)
+    return true, state.component_resource_status
+end
+
+local function find_component_by_type_name(go, pattern)
+    local found = nil
+    pcall(function()
+        local components = go and go:call("get_Components")
+        if not components then return end
+        local count = components:call("get_Count") or 0
+        for i = 0, math.min(count - 1, 160) do
+            local comp = nil
+            pcall(function() comp = components:call("get_Item", i) end)
+            local type_name = trace_type_name(comp)
+            if type_name:find(pattern, 1, true) then
+                found = comp
+                return
+            end
+        end
+    end)
+    return found
+end
+
+local function summarize_for_visual(label, obj, field_limit, method_limit)
+    return {
+        label = safe_string(label),
+        value = safe_string(obj),
+        type = trace_type_name(obj),
+        fields = object_all_field_summary(label, obj, field_limit or 80),
+        methods = object_method_summary(label, obj, {
+            "get_", "set_", "Mesh", "Material", "Resource", "Prefab", "GameObject", "Transform",
+            "Draw", "Visible", "Motion", "Bank", "create", "Create", "instantiate", "Instantiate",
+        }, method_limit or 140),
+    }
+end
+
+local function safe_enumerator_items(collection, limit)
+    local rows = {}
+    if not collection then return rows end
+
+    pcall(function()
+        local iter = collection:call("GetEnumerator")
+        if not iter then return end
+        for i = 0, (limit or 12) - 1 do
+            local moved = iter:call("MoveNext")
+            if not moved then break end
+            local current = iter:call("get_Current")
+            local key, value = nil, nil
+            pcall(function() key = current:call("get_Key") end)
+            pcall(function() value = current:call("get_Value") end)
+            table.insert(rows, {
+                index = i,
+                current = safe_string(current),
+                current_type = trace_type_name(current),
+                key = safe_string(key),
+                key_type = trace_type_name(key),
+                value = safe_string(value),
+                value_type = trace_type_name(value),
+            })
+        end
+    end)
+
+    if #rows > 0 then return rows end
+
+    local count = trace_count(collection)
+    for i = 0, math.min(count - 1, (limit or 12) - 1) do
+        local item = trace_item(collection, i)
+        table.insert(rows, {
+            index = i,
+            current = safe_string(item),
+            current_type = trace_type_name(item),
+            key = "",
+            key_type = "",
+            value = safe_string(item),
+            value_type = trace_type_name(item),
+        })
+    end
+    return rows
+end
+
+local function collect_visual_collection(label, collection, limit)
+    local row = {
+        label = safe_string(label),
+        value = safe_string(collection),
+        type = trace_type_name(collection),
+        count = trace_count(collection),
+        items = safe_enumerator_items(collection, limit or 12),
+        item_details = {},
+    }
+
+    for _, item in ipairs(row.items) do
+        local target = nil
+        if item.value ~= "" then
+            target = nil
+        end
+        -- Re-read from the collection rather than trying to convert strings back
+        -- into objects. The item rows above are for orientation; details below
+        -- are populated by collection-specific callers when they still hold refs.
+    end
+    return row
+end
+
+local function append_mesh_details_from_collection(report, label, collection, limit)
+    local row = collect_visual_collection(label, collection, limit or 12)
+    row.item_details = {}
+
+    pcall(function()
+        local iter = collection and collection:call("GetEnumerator")
+        if not iter then return end
+        for i = 0, (limit or 12) - 1 do
+            local moved = iter:call("MoveNext")
+            if not moved then break end
+            local current = iter:call("get_Current")
+            local value = nil
+            pcall(function() value = current:call("get_Value") end)
+            if not value then value = current end
+            local detail = summarize_for_visual(label .. "[" .. tostring(i) .. "]", value, 80, 140)
+            detail.nested = {}
+            if trace_type_name(value):find("app.MeshUnit", 1, true) then
+                local mesh_go, mesh = nil, nil
+                pcall(function() mesh_go = value:call("get_GameObject") end)
+                pcall(function() mesh = value:call("get_Mesh") end)
+                table.insert(detail.nested, summarize_for_visual(label .. "[" .. tostring(i) .. "].GameObject", mesh_go, 80, 120))
+                table.insert(detail.nested, summarize_for_visual(label .. "[" .. tostring(i) .. "].Mesh", mesh, 140, 180))
+            end
+            table.insert(row.item_details, detail)
+        end
+    end)
+
+    if #row.item_details == 0 then
+        local count = trace_count(collection)
+        for i = 0, math.min(count - 1, (limit or 12) - 1) do
+            local item = trace_item(collection, i)
+            local detail = summarize_for_visual(label .. "[" .. tostring(i) .. "]", item, 80, 140)
+            detail.nested = {}
+            if trace_type_name(item):find("app.MeshUnit", 1, true) then
+                local mesh_go, mesh = nil, nil
+                pcall(function() mesh_go = item:call("get_GameObject") end)
+                pcall(function() mesh = item:call("get_Mesh") end)
+                table.insert(detail.nested, summarize_for_visual(label .. "[" .. tostring(i) .. "].GameObject", mesh_go, 80, 120))
+                table.insert(detail.nested, summarize_for_visual(label .. "[" .. tostring(i) .. "].Mesh", mesh, 140, 180))
+            end
+            table.insert(row.item_details, detail)
+        end
+    end
+
+    table.insert(report.collections, row)
+end
+
+local function run_visual_component_probe()
+    local refs = get_local_player_refs()
+    local report = {
+        time_ms = now_ms(),
+        scene = get_current_scene(),
+        local_player = refs.valid and true or false,
+        local_error = refs.error or "",
+        player_go = safe_string(refs.go),
+        player_go_name = safe_string(refs.name),
+        objects = {},
+        collections = {},
+    }
+
+    if not refs.valid or not refs.go then
+        state.visual_probe_status = "failed: " .. safe_string(refs.error)
+        pcall(function() json.dump_file(VISUAL_COMPONENT_PROBE_FILE, report) end)
+        return false, state.visual_probe_status
+    end
+
+    local mesh_controller = find_component_by_type_name(refs.go, "app.PlayerMeshController")
+    local actor_mesh_controller = find_component_by_type_name(refs.go, "app.ActorPlayerMeshController")
+    local motion = find_component_by_type_name(refs.go, "via.motion.Motion")
+    local actor_motion = find_component_by_type_name(refs.go, "via.motion.ActorMotion")
+    local updater = nil
+    pcall(function() updater = refs.player:call("get_Updater") end)
+
+    table.insert(report.objects, summarize_for_visual("PlayerGameObject", refs.go, 80, 140))
+    table.insert(report.objects, summarize_for_visual("PlayerContext", refs.player, 80, 140))
+    table.insert(report.objects, summarize_for_visual("Cp_A100Updater", updater, 120, 160))
+    table.insert(report.objects, summarize_for_visual("PlayerMeshController", mesh_controller, 140, 180))
+    table.insert(report.objects, summarize_for_visual("ActorPlayerMeshController", actor_mesh_controller, 100, 140))
+    table.insert(report.objects, summarize_for_visual("Motion", motion, 100, 180))
+    table.insert(report.objects, summarize_for_visual("ActorMotion", actor_motion, 80, 140))
+
+    local mesh_unit_dictionary = nil
+    local mesh_list = nil
+    local mesh_parts_dictionary = nil
+    local property_value_containers = nil
+    pcall(function() mesh_unit_dictionary = mesh_controller:get_field("<MeshUnitDictionary>k__BackingField") end)
+    pcall(function() mesh_list = mesh_controller:get_field("_MeshList") end)
+    pcall(function() mesh_parts_dictionary = mesh_controller:get_field("_MeshPartsDictionary") end)
+    pcall(function() property_value_containers = mesh_controller:get_field("_PropertyValueContainers") end)
+
+    append_mesh_details_from_collection(report, "PlayerMeshController.MeshUnitDictionary", mesh_unit_dictionary, 20)
+    append_mesh_details_from_collection(report, "PlayerMeshController.MeshList", mesh_list, 20)
+    append_mesh_details_from_collection(report, "PlayerMeshController.MeshPartsDictionary", mesh_parts_dictionary, 12)
+    append_mesh_details_from_collection(report, "PlayerMeshController.PropertyValueContainers", property_value_containers, 12)
+
+    local harness_mesh = nil
+    pcall(function() harness_mesh = actor_mesh_controller:get_field("_HarnessHolsterMesh") end)
+    if harness_mesh then
+        table.insert(report.objects, summarize_for_visual("ActorPlayerMeshController._HarnessHolsterMesh", harness_mesh, 100, 160))
+    end
+
+    state.visual_probe_status = "dumped objects=" .. tostring(#report.objects)
+        .. " collections=" .. tostring(#report.collections)
+    pcall(function() json.dump_file(VISUAL_COMPONENT_PROBE_FILE, report) end)
+    return true, state.visual_probe_status
 end
 
 local function run_request_spawn_empty_context()
@@ -2885,6 +3635,213 @@ local function run_controller_grace_spawn_probe()
     return true, state.character_spawn_status
 end
 
+local function run_player_load_order_grace_probe()
+    local char_mgr = sdk.get_managed_singleton("app.CharacterManager")
+    if not char_mgr then
+        state.character_spawn_status = "load-order spawn failed: CharacterManager not found"
+        return false, state.character_spawn_status
+    end
+
+    local ctx, lines = create_new_context_id()
+    local kind_grace = get_static_field_value("app.CharacterKindID", {"cp_A100"})
+    if not ctx or not kind_grace then
+        state.character_spawn_status = "load-order spawn failed: missing ContextID/kind | " .. table.concat(lines, " | ")
+        return false, state.character_spawn_status
+    end
+    pcall(function() ctx = ctx:add_ref() end)
+    state.last_spawn_context = ctx
+    pcall(function() state.last_spawn_context_text = safe_string(ctx:call("ToString")) end)
+
+    local spawn_data, control, default_setting, bundle_err = get_spawn_control_bundle(char_mgr, kind_grace, lines)
+    if not spawn_data or not control or not default_setting then
+        state.character_spawn_status = "load-order spawn failed: " .. bundle_err .. " | " .. table.concat(lines, " | ")
+        state.puppet_status = state.character_spawn_status
+        return false, state.character_spawn_status
+    end
+
+    local duplicate, duplicate_status = duplicate_player_spawn_data(char_mgr, kind_grace, lines)
+    table.insert(lines, "duplicate_status=" .. duplicate_status)
+    if not duplicate then
+        state.character_spawn_status = "load-order spawn failed: " .. table.concat(lines, " | ")
+        state.puppet_status = state.character_spawn_status
+        return false, state.character_spawn_status
+    end
+
+    set_fields_by_type_or_name(duplicate, "app.ContextID", {}, ctx, "SpawnData.ContextID", lines)
+    set_fields_by_type_or_name(duplicate, "app.CharacterKindID", {}, kind_grace, "SpawnData.CharacterKindID", lines)
+    set_named_field_for_probe(duplicate, "<ResumeType>k__BackingField", 1, "SpawnData", lines)
+    set_named_field_for_probe(duplicate, "<IsEventWait>k__BackingField", false, "SpawnData", lines)
+    set_named_field_for_probe(duplicate, "<IsForceTransform>k__BackingField", true, "SpawnData", lines)
+    set_named_field_for_probe(duplicate, "<IsFirstSpawn>k__BackingField", true, "SpawnData", lines)
+    set_named_field_for_probe(duplicate, "<SpawnControl>k__BackingField", control, "SpawnData", lines)
+
+    local refs = get_local_player_refs()
+    if refs.valid and refs.xform then
+        local pos = nil
+        local rot = nil
+        pcall(function() pos = refs.xform:call("get_Position") end)
+        pcall(function() rot = refs.xform:call("get_Rotation") end)
+        if pos then set_named_field_for_probe(duplicate, "<Position>k__BackingField", pos, "SpawnData", lines) end
+        if rot then set_named_field_for_probe(duplicate, "<Rotation>k__BackingField", rot, "SpawnData", lines) end
+    else
+        table.insert(lines, "local transform skipped: " .. safe_string(refs.error))
+    end
+
+    local old_spawn_context = nil
+    local old_request_end = nil
+    local old_permitted = nil
+    local old_init_suspended = nil
+    pcall(function() old_spawn_context = control:get_field("_SpawnContextID") end)
+    pcall(function() old_request_end = control:get_field("IsSpawnRequestEnd") end)
+    pcall(function() old_permitted = control:get_field("<HasPermittedSpawn>k__BackingField") end)
+    pcall(function() old_init_suspended = control:get_field("_InitStateSuspended") end)
+    table.insert(lines, "control old _SpawnContextID=" .. safe_string(old_spawn_context) .. " IsSpawnRequestEnd=" .. safe_string(old_request_end) .. " HasPermitted=" .. safe_string(old_permitted) .. " InitSuspended=" .. safe_string(old_init_suspended))
+
+    set_named_field_for_probe(control, "_SpawnContextID", ctx, "Control", lines)
+    set_named_field_for_probe(control, "IsSpawnRequestEnd", false, "Control", lines)
+    set_named_field_for_probe(control, "<HasPermittedSpawn>k__BackingField", false, "Control", lines)
+    set_named_field_for_probe(control, "_InitStateSuspended", false, "Control", lines)
+
+    for _, call_name in ipairs({"registerSpawnGroup(app.ICharacterSpawnControl)", "registerSpawnGroup"}) do
+        local ok_group, err_group = pcall(function()
+            char_mgr:call(call_name, control)
+        end)
+        table.insert(lines, call_name .. "(load-order control) -> " .. (ok_group and "ok" or ("ERR " .. safe_string(err_group))))
+        if ok_group then break end
+    end
+
+    local factory = nil
+    for _, call_name in ipairs({"getCharacterContextFactory(app.CharacterKindID)", "getCharacterContextFactory"}) do
+        local ok_factory, result = pcall(function()
+            return char_mgr:call(call_name, kind_grace)
+        end)
+        table.insert(lines, call_name .. "(load-order cp_A100) -> " .. (ok_factory and safe_string(result) or ("ERR " .. safe_string(result))))
+        if ok_factory and result and not factory then
+            factory = result
+        end
+    end
+
+    local context_ref = nil
+    if factory then
+        for _, attempt in ipairs({
+            {
+                name = "readyContext(app.ContextID, app.CharacterKindID, System.Func`1<app.CharacterContext>, System.Boolean)",
+                args = { ctx, kind_grace, factory, false },
+            },
+            {
+                name = "readyContext(app.ContextID, app.CharacterKindID, System.Func`1<app.CharacterContext>)",
+                args = { ctx, kind_grace, factory },
+            },
+            {
+                name = "readyContext",
+                args = { ctx, kind_grace, factory },
+            },
+        }) do
+            local ok_ready, result = pcall(function()
+                return char_mgr:call(attempt.name, unpack_args(attempt.args))
+            end)
+            table.insert(lines, attempt.name .. "(load-order ctx) -> " .. (ok_ready and safe_string(result) or ("ERR " .. safe_string(result))))
+            if ok_ready and result and not context_ref then
+                context_ref = result
+                pcall(function() context_ref = context_ref:add_ref() end)
+                break
+            end
+        end
+    end
+
+    if context_ref then
+        for _, call_name in ipairs({"restoreContext(app.ContextID, app.CharacterContext)", "restoreContext"}) do
+            local ok_restore, result_restore = pcall(function()
+                return char_mgr:call(call_name, ctx, context_ref)
+            end)
+            table.insert(lines, call_name .. "(load-order ctx) -> " .. (ok_restore and safe_string(result_restore) or ("ERR " .. safe_string(result_restore))))
+            if ok_restore then break end
+        end
+    else
+        table.insert(lines, "restoreContext skipped: no context_ref")
+    end
+
+    local registered = false
+    for _, call_name in ipairs({"registerSpawnData(app.CharacterSpawnData)", "registerSpawnData"}) do
+        local ok_register, err_register = pcall(function()
+            char_mgr:call(call_name, duplicate)
+        end)
+        table.insert(lines, call_name .. "(load-order duplicate) -> " .. (ok_register and "ok" or ("ERR " .. safe_string(err_register))))
+        if ok_register then
+            registered = true
+            break
+        end
+    end
+
+    if context_ref then
+        pcall(function()
+            local go_before = context_ref:call("get_GameObject")
+            table.insert(lines, "Context before controller get_GameObject -> " .. safe_string(go_before))
+        end)
+        pcall(function()
+            local updater_before = context_ref:call("get_Updater")
+            table.insert(lines, "Context before controller get_Updater -> " .. safe_string(updater_before))
+        end)
+    end
+
+    local setting = make_controller_create_setting(default_setting, kind_grace, lines)
+    for _, call in ipairs({
+        { name = "setupControlCharacter(app.LevelPlayerCreateController.CreateSetting)", args = { setting } },
+        { name = "setupCommonMessageKind(app.LevelPlayerCreateController.CreateSetting, app.CharacterContext)", args = { setting, context_ref }, require_context = true },
+        { name = "app.ICharacterSpawnControl.requestSpawn()", args = {} },
+        { name = "app.ICharacterSpawnControl.requestResume(System.Int32)", args = { 0 } },
+        { name = "createControlCharacter()", args = {} },
+    }) do
+        if call.require_context and not context_ref then
+            table.insert(lines, "Control:" .. call.name .. " -> skipped (no context)")
+        else
+            local ok_call, err_call = pcall(function()
+                control:call(call.name, unpack_args(call.args))
+            end)
+            table.insert(lines, "Control:" .. call.name .. " -> " .. (ok_call and "ok" or ("ERR " .. safe_string(err_call))))
+        end
+    end
+
+    if context_ref then
+        pcall(function()
+            local go = context_ref:call("get_GameObject")
+            table.insert(lines, "Context after controller get_GameObject -> " .. safe_string(go))
+            if go then
+                state.puppet_go = go:add_ref()
+                state.puppet_xform = go:call("get_Transform")
+                pcall(function() state.puppet_xform = state.puppet_xform:add_ref() end)
+            end
+        end)
+        pcall(function()
+            local updater = context_ref:call("get_Updater")
+            table.insert(lines, "Context after controller get_Updater -> " .. safe_string(updater))
+        end)
+    end
+
+    pcall(function() control:set_field("_SpawnContextID", old_spawn_context) end)
+    if old_request_end ~= nil then pcall(function() control:set_field("IsSpawnRequestEnd", old_request_end) end) end
+    if old_permitted ~= nil then pcall(function() control:set_field("<HasPermittedSpawn>k__BackingField", old_permitted) end) end
+    if old_init_suspended ~= nil then pcall(function() control:set_field("_InitStateSuspended", old_init_suspended) end) end
+
+    pcall(function()
+        json.dump_file(DATA_PREFIX .. "load_order_spawn_probe.json", {
+            time_ms = now_ms(),
+            scene = get_current_scene(),
+            ok = context_ref ~= nil or registered,
+            context = state.last_spawn_context_text,
+            lines = lines,
+        })
+    end)
+
+    local has_go = false
+    if context_ref then
+        pcall(function() has_go = context_ref:call("get_GameObject") ~= nil end)
+    end
+    state.character_spawn_status = "load-order spawn " .. (has_go and "has gameobject" or (registered and "sent" or "failed")) .. " for " .. safe_string(state.last_spawn_context_text)
+    state.puppet_status = has_go and "Load-order Grace context has GameObject" or state.character_spawn_status
+    return context_ref ~= nil or registered, state.character_spawn_status
+end
+
 local function disable_puppet_components(go)
     pcall(function()
         local components = go:call("get_Components")
@@ -3388,6 +4345,10 @@ local function write_dev_result(id, ok, message)
             level_trace_events = #state.level_trace_events,
             pool_trace_status = state.pool_trace_status,
             pool_trace_events = #state.pool_trace_events,
+            bind_trace_status = state.bind_trace_status,
+            bind_trace_events = #state.bind_trace_events,
+            component_resource_status = state.component_resource_status,
+            visual_probe_status = state.visual_probe_status,
         })
     end)
 end
@@ -3465,11 +4426,36 @@ local function poll_dev_command()
         push_pool_trace_event("dump", true)
         dump_pool_trace(true)
         message = state.pool_trace_status .. " events=" .. tostring(#state.pool_trace_events)
+    elseif action == "start_bind_trace" then
+        state.bind_trace_enabled = true
+        cfg.bind_trace_enabled = true
+        save_cfg()
+        state.spawn_hook_events = {}
+        state.spawn_hook_dirty = true
+        state.spawn_hook_status = "cleared for bind trace"
+        reset_bind_trace(cmd.text ~= "" and cmd.text or "dev command")
+        dump_spawn_hook_log(true)
+        dump_bind_trace(true)
+        message = state.bind_trace_status
+    elseif action == "stop_bind_trace" then
+        state.bind_trace_enabled = false
+        cfg.bind_trace_enabled = false
+        save_cfg()
+        state.bind_trace_status = "stopped events=" .. tostring(#state.bind_trace_events)
+        dump_bind_trace(true)
+        message = state.bind_trace_status
+    elseif action == "dump_bind_trace" then
+        dump_bind_trace(true)
+        message = state.bind_trace_status .. " events=" .. tostring(#state.bind_trace_events)
     elseif action == "diagnostics" then
         dump_runtime_diagnostics()
         message = "runtime diagnostics dumped"
     elseif action == "character_probe" then
         ok, message = run_character_object_probe()
+    elseif action == "component_resource_probe" then
+        ok, message = run_component_resource_probe()
+    elseif action == "visual_component_probe" then
+        ok, message = run_visual_component_probe()
     elseif action == "spawn_empty_context" then
         ok = false
         message = "disabled: empty ContextID can pollute runtime state; use spawn_new_context"
@@ -3481,6 +4467,8 @@ local function poll_dev_command()
         ok, message = run_ready_registered_duplicate()
     elseif action == "spawn_controller_grace" then
         ok, message = run_controller_grace_spawn_probe()
+    elseif action == "spawn_load_order_grace" then
+        ok, message = run_player_load_order_grace_probe()
     elseif action == "context_create_probe" then
         ok, message = run_context_create_probe()
     elseif action == "set_prefab" then
@@ -3796,12 +4784,24 @@ local function draw_main_window()
     if state.resource_probe_status ~= "" then
         imgui.text("Resource probe: " .. safe_string(state.resource_probe_status))
     end
+    if state.component_resource_status ~= "" then
+        imgui.text("Component resource probe: " .. safe_string(state.component_resource_status))
+    end
+    if state.visual_probe_status ~= "" then
+        imgui.text("Visual probe: " .. safe_string(state.visual_probe_status))
+    end
     if imgui.button("Probe Grace Resource Paths") then
         run_resource_probe(cfg.prefab_path)
     end
     imgui.same_line()
     if imgui.button("Probe Character Objects") then
         run_character_object_probe()
+    end
+    if imgui.button("Probe Grace Component Resources") then
+        run_component_resource_probe()
+    end
+    if imgui.button("Probe Grace Visual Mesh") then
+        run_visual_component_probe()
     end
     if imgui.button("Probe Grace Prefab/Clone") then
         try_spawn_puppet(false)
@@ -3820,6 +4820,10 @@ local function draw_main_window()
     if imgui.button("Try Controller Grace Spawn") then
         run_controller_grace_spawn_probe()
     end
+    imgui.same_line()
+    if imgui.button("Try Load-Order Grace Spawn") then
+        run_player_load_order_grace_probe()
+    end
     if imgui.button("Probe New ContextID") then
         run_context_create_probe()
     end
@@ -3829,6 +4833,7 @@ local function draw_main_window()
     imgui.text("Spawn hook: " .. safe_string(state.spawn_hook_status))
     imgui.text("Level trace: " .. safe_string(state.level_trace_status))
     imgui.text("Pool trace: " .. safe_string(state.pool_trace_status))
+    imgui.text("Bind trace: " .. safe_string(state.bind_trace_status))
     local trace_changed, trace_enabled = imgui.checkbox("Record level-load trace", state.level_trace_enabled)
     if trace_changed then
         state.level_trace_enabled = trace_enabled
@@ -3865,6 +4870,17 @@ local function draw_main_window()
         push_pool_trace_event("ui dump", true)
         dump_pool_trace(true)
     end
+    if imgui.button("Reset Bind Trace") then
+        state.bind_trace_enabled = true
+        cfg.bind_trace_enabled = true
+        save_cfg()
+        reset_bind_trace("ui reset")
+        dump_bind_trace(true)
+    end
+    imgui.same_line()
+    if imgui.button("Dump Bind Trace") then
+        dump_bind_trace(true)
+    end
     if imgui.button("Refresh Spawn Diagnostics") then
         dump_runtime_diagnostics()
     end
@@ -3877,6 +4893,7 @@ end
 re.on_frame(function()
     local t = now()
     install_spawn_observer_hooks()
+    install_bind_trace_hooks()
     if state.level_trace_enabled then
         local scene = get_current_scene()
         if scene ~= state.level_trace_last_scene then
@@ -3926,6 +4943,10 @@ re.on_frame(function()
     if t >= state.pool_trace_last_dump + 0.50 then
         dump_pool_trace(false)
         state.pool_trace_last_dump = t
+    end
+    if t >= state.bind_trace_last_dump + 0.50 then
+        dump_bind_trace(false)
+        state.bind_trace_last_dump = t
     end
     apply_remote_pose()
 end)
