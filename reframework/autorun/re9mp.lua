@@ -530,7 +530,14 @@ local function collect_method_signatures()
             "requestSpawn", "requestInstantiateMontage", "getSpawnDataRef", "getSpawnedContextRefList",
             "getSpawnableContextList", "getPlayerContextID", "getPlayerContextRef", "getPlayerContextRefFast",
             "getContextRef", "getManagedContextID", "readyContext", "registerPlayerContextIDList",
+            "registerSpawnData", "unregisterSpawnData", "registerSpawnGroup", "unregisterSpawnGroup",
+            "storeContext", "restoreContext", "unregisterContext", "clearContext", "getCharacterContextFactory",
+            "getAndRequestSpawnOwner", "clearSpawnOwner", "makeSpawnControlBackupData", "getSpawnControlBackup",
         }},
+        {"app.CharacterSpawnData", {".ctor", "duplicate"}},
+        {"app.PlayerSpawnData", {".ctor", "duplicate"}},
+        {"app.CharacterContext", {"get_GameObject", "get_Transform", "get_ContextID", "get_CharacterKindID"}},
+        {"app.PlayerContext", {"get_GameObject", "get_Transform", "get_ContextID", "get_CharacterKindID"}},
         {"via.Prefab", {"instantiate"}},
         {"via.GameObject", {"create", "createComponent"}},
         {"via.Scene", {"findGameObject", "findGameObjects", "findGameObjectsWithTag"}},
@@ -993,6 +1000,17 @@ local function describe_value_for_probe(label, value)
     return table.concat(parts, " ")
 end
 
+local function get_parent_type_definition(td)
+    if not td then return nil end
+    local parent = nil
+    local ok_parent = pcall(function() parent = td:get_parent_type() end)
+    if not ok_parent or not parent then
+        ok_parent = pcall(function() parent = td:get_parent_type_definition() end)
+    end
+    if not ok_parent then return nil end
+    return parent
+end
+
 local function object_field_summary(label, obj, limit)
     local lines = {}
     if not obj or not obj.get_type_definition then return lines end
@@ -1029,20 +1047,79 @@ local function object_all_field_summary(label, obj, limit)
     pcall(function()
         local td = obj:get_type_definition()
         table.insert(lines, label .. " all-fields type=" .. (td and td:get_full_name() or "?"))
-        if not td then return end
         local n = 0
-        for _, field in ipairs(td:get_fields()) do
-            local name = field:get_name() or ""
-            local ftype = field:get_type()
-            local type_name = ftype and ftype:get_full_name() or "?"
-            local value = nil
-            pcall(function() value = obj:get_field(name) end)
-            table.insert(lines, "  " .. type_name .. " " .. name .. " = " .. safe_string(value))
-            n = n + 1
-            if n >= (limit or 32) then break end
+        local depth = 0
+        local seen = {}
+        while td and depth < 8 do
+            local type_name_for_level = td:get_full_name() or "?"
+            if seen[type_name_for_level] then break end
+            seen[type_name_for_level] = true
+            if depth > 0 then
+                table.insert(lines, label .. " base-fields type=" .. type_name_for_level)
+            end
+            for _, field in ipairs(td:get_fields()) do
+                local name = field:get_name() or ""
+                local ftype = field:get_type()
+                local type_name = ftype and ftype:get_full_name() or "?"
+                local value = nil
+                pcall(function() value = obj:get_field(name) end)
+                table.insert(lines, "  " .. type_name .. " " .. name .. " = " .. safe_string(value))
+                n = n + 1
+                if n >= (limit or 32) then return end
+            end
+
+            local parent = get_parent_type_definition(td)
+            if not parent then break end
+            td = parent
+            depth = depth + 1
         end
     end)
     return lines
+end
+
+local function set_fields_by_type_or_name(obj, target_type_name, name_markers, value, label, lines)
+    if not obj or not obj.get_type_definition then return 0 end
+    local changed = 0
+    pcall(function()
+        local td = obj:get_type_definition()
+        local depth = 0
+        local seen = {}
+        while td and depth < 8 do
+            local level_name = td:get_full_name() or "?"
+            if seen[level_name] then break end
+            seen[level_name] = true
+
+            for _, field in ipairs(td:get_fields()) do
+                local name = field:get_name() or ""
+                local ftype = field:get_type()
+                local type_name = ftype and ftype:get_full_name() or ""
+                local matches = type_name == target_type_name
+                if not matches then
+                    for _, marker in ipairs(name_markers or {}) do
+                        if name:find(marker, 1, true) then
+                            matches = true
+                            break
+                        end
+                    end
+                end
+
+                if matches then
+                    local before = nil
+                    pcall(function() before = obj:get_field(name) end)
+                    local ok_set, err = pcall(function() obj:set_field(name, value) end)
+                    local after = nil
+                    pcall(function() after = obj:get_field(name) end)
+                    table.insert(lines, label .. " set " .. level_name .. "." .. name .. " [" .. type_name .. "] " .. safe_string(before) .. " -> " .. safe_string(after) .. " = " .. (ok_set and "ok" or ("ERR " .. safe_string(err))))
+                    if ok_set then changed = changed + 1 end
+                end
+            end
+
+            td = get_parent_type_definition(td)
+            depth = depth + 1
+        end
+    end)
+    table.insert(lines, label .. " changed_fields=" .. tostring(changed))
+    return changed
 end
 
 local function object_method_summary(label, obj, patterns, limit)
@@ -1573,6 +1650,150 @@ local function run_request_spawn_new_context()
     state.character_spawn_status = "requestSpawn new context failed: " .. safe_string(err)
     state.puppet_status = state.character_spawn_status
     return false, state.character_spawn_status
+end
+
+local function duplicate_player_spawn_data(char_mgr, kind_grace, lines)
+    local player_context_id = nil
+    for _, call_name in ipairs({"getPlayerContextID(app.CharacterKindID)", "getPlayerContextID"}) do
+        local ok, result = pcall(function()
+            return char_mgr:call(call_name, kind_grace)
+        end)
+        table.insert(lines, call_name .. "(cp_A100) -> " .. (ok and safe_string(result) or ("ERR " .. safe_string(result))))
+        if ok and result and not player_context_id then
+            player_context_id = result
+        end
+    end
+    if not player_context_id then
+        return nil, "player ContextID for cp_A100 not found"
+    end
+
+    local player_spawn_data = nil
+    for _, call_name in ipairs({"getSpawnDataRef(app.ContextID)", "getSpawnDataRef"}) do
+        local ok, result = pcall(function()
+            return char_mgr:call(call_name, player_context_id)
+        end)
+        table.insert(lines, call_name .. "(PlayerContextID.cp_A100) -> " .. (ok and safe_string(result) or ("ERR " .. safe_string(result))))
+        if ok and result and not player_spawn_data then
+            player_spawn_data = result
+        end
+    end
+    if not player_spawn_data then
+        return nil, "player spawn data for cp_A100 not found"
+    end
+
+    for _, call_name in ipairs({"duplicate()", "duplicate"}) do
+        local ok, result = pcall(function()
+            return player_spawn_data:call(call_name)
+        end)
+        table.insert(lines, "PlayerSpawnData:" .. call_name .. " -> " .. (ok and safe_string(result) or ("ERR " .. safe_string(result))))
+        if ok and result then
+            pcall(function() result = result:add_ref() end)
+            return result, "duplicated via " .. call_name
+        end
+    end
+
+    local ok_new, copy_or_err = pcall(function()
+        return sdk.create_instance("app.PlayerSpawnData")
+    end)
+    table.insert(lines, "sdk.create_instance(app.PlayerSpawnData) -> " .. (ok_new and safe_string(copy_or_err) or ("ERR " .. safe_string(copy_or_err))))
+    if ok_new and copy_or_err then
+        for _, ctor in ipairs({".ctor(app.PlayerSpawnData)", ".ctor"}) do
+            local ok_ctor, err = pcall(function()
+                copy_or_err:call(ctor, player_spawn_data)
+            end)
+            table.insert(lines, "PlayerSpawnData:" .. ctor .. "(player_spawn_data) -> " .. (ok_ctor and "ok" or ("ERR " .. safe_string(err))))
+            if ok_ctor then
+                pcall(function() copy_or_err = copy_or_err:add_ref() end)
+                return copy_or_err, "copied via " .. ctor
+            end
+        end
+    end
+
+    return nil, "could not duplicate player spawn data"
+end
+
+local function run_request_spawn_registered_duplicate()
+    local char_mgr = sdk.get_managed_singleton("app.CharacterManager")
+    if not char_mgr then
+        state.character_spawn_status = "registered duplicate spawn failed: CharacterManager not found"
+        return false, state.character_spawn_status
+    end
+
+    local ctx, lines = create_new_context_id()
+    local kind_grace = get_static_field_value("app.CharacterKindID", {"cp_A100"})
+    local montage_invalid = get_static_field_value("app.MontageID", {"Invalid"})
+    local purpose_default = get_static_field_value("app.CharacterUsePurposeFlag", {"Default"}) or 0
+    if not ctx or not kind_grace or not montage_invalid then
+        state.character_spawn_status = "registered duplicate spawn failed: missing ContextID/Kind/Montage | " .. table.concat(lines, " | ")
+        return false, state.character_spawn_status
+    end
+
+    pcall(function() ctx = ctx:add_ref() end)
+    state.last_spawn_context = ctx
+    pcall(function() state.last_spawn_context_text = safe_string(ctx:call("ToString")) end)
+
+    local duplicate, duplicate_status = duplicate_player_spawn_data(char_mgr, kind_grace, lines)
+    table.insert(lines, "duplicate_status=" .. duplicate_status)
+    if not duplicate then
+        state.character_spawn_status = "registered duplicate spawn failed: " .. table.concat(lines, " | ")
+        state.puppet_status = state.character_spawn_status
+        return false, state.character_spawn_status
+    end
+
+    set_fields_by_type_or_name(duplicate, "app.ContextID", {"ContextID", "ContextId", "Context"}, ctx, "SpawnData.ContextID", lines)
+    set_fields_by_type_or_name(duplicate, "app.CharacterKindID", {"CharacterKindID", "CharacterKind", "KindID"}, kind_grace, "SpawnData.CharacterKindID", lines)
+
+    local registered = false
+    for _, call_name in ipairs({"registerSpawnData(app.CharacterSpawnData)", "registerSpawnData"}) do
+        local ok, err = pcall(function()
+            char_mgr:call(call_name, duplicate)
+        end)
+        table.insert(lines, call_name .. "(duplicate) -> " .. (ok and "ok" or ("ERR " .. safe_string(err))))
+        if ok then
+            registered = true
+            break
+        end
+    end
+    if not registered then
+        state.character_spawn_status = "registered duplicate spawn failed: registerSpawnData failed | " .. table.concat(lines, " | ")
+        state.puppet_status = state.character_spawn_status
+        return false, state.character_spawn_status
+    end
+
+    for _, call_name in ipairs({"getSpawnDataRef(app.ContextID)", "getSpawnDataRef"}) do
+        local ok, result = pcall(function()
+            return char_mgr:call(call_name, ctx)
+        end)
+        table.insert(lines, call_name .. "(new ctx after register) -> " .. (ok and safe_string(result) or ("ERR " .. safe_string(result))))
+    end
+
+    local ok_spawn, err_spawn = pcall(function()
+        char_mgr:call(
+            "requestSpawn(app.ContextID, app.CharacterKindID, app.MontageID, System.Int32, System.Boolean, app.CharacterUsePurposeFlag)",
+            ctx,
+            kind_grace,
+            montage_invalid,
+            0,
+            false,
+            purpose_default
+        )
+    end)
+    table.insert(lines, "requestSpawn(new registered ctx) -> " .. (ok_spawn and "ok" or ("ERR " .. safe_string(err_spawn))))
+
+    dump_spawn_hook_log(true)
+    pcall(function()
+        json.dump_file(DATA_PREFIX .. "registered_spawn_probe.json", {
+            time_ms = now_ms(),
+            scene = get_current_scene(),
+            ok = ok_spawn,
+            context = state.last_spawn_context_text,
+            lines = lines,
+        })
+    end)
+
+    state.character_spawn_status = "registered duplicate spawn " .. (ok_spawn and "sent" or "failed") .. " for " .. safe_string(state.last_spawn_context_text)
+    state.puppet_status = ok_spawn and "Registered duplicate requestSpawn sent; check for Grace" or state.character_spawn_status
+    return ok_spawn, state.character_spawn_status
 end
 
 local function disable_puppet_components(go)
@@ -2124,6 +2345,8 @@ local function poll_dev_command()
         message = "disabled: empty ContextID can pollute runtime state; use spawn_new_context"
     elseif action == "spawn_new_context" then
         ok, message = run_request_spawn_new_context()
+    elseif action == "spawn_registered_duplicate" then
+        ok, message = run_request_spawn_registered_duplicate()
     elseif action == "context_create_probe" then
         ok, message = run_context_create_probe()
     elseif action == "set_prefab" then
@@ -2451,6 +2674,10 @@ local function draw_main_window()
     end
     if imgui.button("Try New Context Spawn") then
         run_request_spawn_new_context()
+    end
+    imgui.same_line()
+    if imgui.button("Try Registered Grace Spawn") then
+        run_request_spawn_registered_duplicate()
     end
     if imgui.button("Probe New ContextID") then
         run_context_create_probe()
