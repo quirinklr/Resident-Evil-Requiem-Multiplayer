@@ -1447,6 +1447,72 @@ local function append_iterable_summary(lines, label, obj, limit)
     end)
 end
 
+local function append_safe_call_summary(lines, label, obj, call_names)
+    if not obj then return end
+    for _, call_name in ipairs(call_names or {}) do
+        local ok, result = pcall(function()
+            return obj:call(call_name)
+        end)
+        table.insert(lines, label .. ":" .. call_name .. " -> " .. (ok and safe_string(result) or ("ERR " .. safe_string(result))))
+    end
+end
+
+local function append_player_context_deep_summary(lines, label, player_context)
+    if not player_context then return end
+    table.insert(lines, label .. " deep=" .. safe_string(player_context))
+    append_safe_call_summary(lines, label, player_context, {
+        "get_GameObject",
+        "get_Transform",
+        "get_Updater",
+        "get_IsActivePlayer",
+        "get_IsTPSCharacter",
+        "get_IsFPSCharacter",
+        "get_IsCp_A1Character",
+    })
+
+    for _, field_name in ipairs({
+        "<Common>k__BackingField",
+        "<TPSUnit>k__BackingField",
+        "<FPSUnit>k__BackingField",
+        "<Cp_A1Unit>k__BackingField",
+        "<ContextUnitArray>k__BackingField",
+    }) do
+        local value = nil
+        pcall(function() value = player_context:get_field(field_name) end)
+        local unit_label = label .. "." .. field_name
+        table.insert(lines, unit_label .. "=" .. safe_string(value))
+        append_safe_call_summary(lines, unit_label, value, {
+            "get_GameObject",
+            "get_Transform",
+            "get_Updater",
+            "get_Owner",
+            "get_Context",
+            "get_Parent",
+        })
+        for _, line in ipairs(object_field_summary(unit_label, value, 32)) do
+            table.insert(lines, line)
+        end
+        for _, line in ipairs(object_method_summary(unit_label, value, {
+            "GameObject", "Transform", "Updater", "Owner", "Context", "Parent", "Create", "Initialize", "Setup", "Spawn", "Mesh", "Motion",
+        }, 80)) do
+            table.insert(lines, line)
+        end
+    end
+
+    local updater = nil
+    pcall(function() updater = player_context:call("get_Updater") end)
+    if updater then
+        for _, line in ipairs(object_field_summary(label .. ".Updater", updater, 48)) do
+            table.insert(lines, line)
+        end
+        for _, line in ipairs(object_method_summary(label .. ".Updater", updater, {
+            "GameObject", "Transform", "Context", "Owner", "Create", "Initialize", "Setup", "Spawn", "Start", "Update", "Mesh", "Motion",
+        }, 100)) do
+            table.insert(lines, line)
+        end
+    end
+end
+
 local function run_character_object_probe()
     local refs = get_local_player_refs()
     if refs.valid and refs.go then
@@ -1590,7 +1656,17 @@ local function run_character_object_probe()
             pcall(function()
                 local field_value = char_mgr:get_field(field_info[2])
                 append_iterable_summary(lines, field_info[1], field_value, 12)
-                if field_info[1] == "Field.PlayerContextIDHolder" and field_value then
+                if field_info[1] == "Field.PlayerContextList" and field_value then
+                    local count = nil
+                    pcall(function() count = field_value:call("get_Count") end)
+                    if count then
+                        for i = 0, math.min((tonumber(count) or 0) - 1, 2) do
+                            local item = nil
+                            pcall(function() item = field_value:call("get_Item", i) end)
+                            append_player_context_deep_summary(lines, field_info[1] .. "[" .. tostring(i) .. "]", item)
+                        end
+                    end
+                elseif field_info[1] == "Field.PlayerContextIDHolder" and field_value then
                     local count = nil
                     pcall(function() count = field_value:call("get_Count") end)
                     if count then
