@@ -10,6 +10,7 @@ local DEV_COMMAND_FILE = DATA_PREFIX .. "dev_command.json"
 local DEV_RESULT_FILE = DATA_PREFIX .. "dev_result.json"
 local SPAWN_HOOK_FILE = DATA_PREFIX .. "spawn_hook_log.json"
 local LEVEL_TRACE_FILE = DATA_PREFIX .. "level_load_trace.json"
+local POOL_TRACE_FILE = DATA_PREFIX .. "pool_trace.json"
 local RESOURCE_PROBE_FILE = DATA_PREFIX .. "resource_probe.json"
 local LOCAL_FILE = DATA_PREFIX .. "local_snapshot.json"
 local STATUS_FILE = DATA_PREFIX .. "status.json"
@@ -26,6 +27,7 @@ local cfg = {
     auto_runtime_diagnostics = false,
     level_trace_enabled = false,
     controller_trace_enabled = false,
+    pool_trace_enabled = false,
 }
 
 pcall(function()
@@ -110,6 +112,15 @@ local state = {
     level_trace_started_ms = 0,
     level_trace_last_dump = 0,
     level_trace_last_scene = "",
+    pool_trace_enabled = cfg.pool_trace_enabled and true or false,
+    pool_trace_status = "waiting",
+    pool_trace_events = {},
+    pool_trace_dirty = false,
+    pool_trace_started_ms = 0,
+    pool_trace_last_dump = 0,
+    pool_trace_last_sample = 0,
+    pool_trace_last_scene = "",
+    pool_trace_last_signature = "",
     resource_probe_status = "",
     character_object_probe = "",
     last_spawn_context = nil,
@@ -548,7 +559,14 @@ local function collect_method_signatures()
         {"app.CharacterSpawnData", {".ctor", "duplicate"}},
         {"app.PlayerSpawnData", {".ctor", "duplicate"}},
         {"app.CharacterContext", {"get_GameObject", "get_Transform", "get_ContextID", "get_CharacterKindID"}},
-        {"app.PlayerContext", {"get_GameObject", "get_Transform", "get_ContextID", "get_CharacterKindID"}},
+        {"app.PlayerContext", {"get_GameObject", "get_Transform", "get_ContextID", "get_CharacterKindID", "get_Updater", "set_Updater", "onCreateContext", "onUpdateStructureData"}},
+        {"app.CharacterPoolInfo", {
+            "get_GameObjectFinalized", "set_GameObjectFinalized", "get_Updater", "set_Updater",
+            "get_Reserved", "set_Reserved", "get_Used", "set_Used",
+        }},
+        {"app.CharacterUpdaterBase", {"get_GameObject", "get_Transform", "get_Context", "set_Context", "get_Owner", "set_Owner"}},
+        {"app.PlayerUpdaterBase", {"get_GameObject", "get_Transform", "get_Context", "set_Context", "get_Owner", "set_Owner"}},
+        {"app.Cp_A100Updater", {"get_GameObject", "get_Transform", "get_Context", "set_Context", "get_Owner", "set_Owner"}},
         {"app.LevelPlayerCreateController", {
             "setupControlCharacter", "setupCommonMessageKind", "createControlCharacter",
             "suspendChapterInitControlCharacter", "destroyControlCharacter",
@@ -708,6 +726,202 @@ local function dump_level_trace(force)
             scene = get_current_scene(),
             started_ms = state.level_trace_started_ms,
             events = state.level_trace_events,
+        })
+    end)
+end
+
+local function trace_type_name(obj)
+    local type_name = ""
+    pcall(function()
+        if obj and obj.get_type_definition then
+            local td = obj:get_type_definition()
+            type_name = td and td:get_full_name() or ""
+        end
+    end)
+    return type_name
+end
+
+local function trace_call(obj, method_name)
+    local value = nil
+    pcall(function()
+        if obj then value = obj:call(method_name) end
+    end)
+    return value
+end
+
+local function trace_count(obj)
+    local count = nil
+    pcall(function() if obj then count = obj:call("get_Count") end end)
+    if count == nil then
+        pcall(function() if obj then count = obj:get_size() end end)
+    end
+    return tonumber(count) or 0
+end
+
+local function trace_item(obj, index)
+    local item = nil
+    local ok_item = pcall(function()
+        if obj then item = obj:call("get_Item", index) end
+    end)
+    if not ok_item or item == nil then
+        pcall(function()
+            if obj then item = obj:get_element(index) end
+        end)
+    end
+    return item
+end
+
+local function trace_context_summary(ctx, index)
+    local row = {
+        index = index,
+        ref = safe_string(ctx),
+        type = trace_type_name(ctx),
+    }
+    if not ctx then return row end
+
+    local go = trace_call(ctx, "get_GameObject")
+    local updater = trace_call(ctx, "get_Updater")
+    row.game_object = safe_string(go)
+    row.updater = safe_string(updater)
+    row.updater_type = trace_type_name(updater)
+    row.transform = safe_string(trace_call(ctx, "get_Transform"))
+    row.active = trace_call(ctx, "get_IsActivePlayer")
+    row.tps = trace_call(ctx, "get_IsTPSCharacter")
+    row.fps = trace_call(ctx, "get_IsFPSCharacter")
+    row.cp_a1 = trace_call(ctx, "get_IsCp_A1Character")
+    return row
+end
+
+local function trace_pool_summary(pool, index)
+    local row = {
+        index = index,
+        ref = safe_string(pool),
+        type = trace_type_name(pool),
+    }
+    if not pool then return row end
+
+    local updater = nil
+    local used = nil
+    local reserved = nil
+    local finalized = nil
+    pcall(function() updater = pool:get_field("<Updater>k__BackingField") end)
+    pcall(function() used = pool:get_field("<Used>k__BackingField") end)
+    pcall(function() reserved = pool:get_field("<Reserved>k__BackingField") end)
+    pcall(function() finalized = pool:get_field("<GameObjectFinalized>k__BackingField") end)
+
+    row.used = used
+    row.reserved = reserved
+    row.finalized = finalized
+    row.updater = safe_string(updater)
+    row.updater_type = trace_type_name(updater)
+    row.updater_game_object = safe_string(trace_call(updater, "get_GameObject"))
+    row.updater_transform = safe_string(trace_call(updater, "get_Transform"))
+    row.updater_context = safe_string(trace_call(updater, "get_Context"))
+    row.updater_owner = safe_string(trace_call(updater, "get_Owner"))
+    return row
+end
+
+local function build_pool_trace_snapshot(reason)
+    local char_mgr = sdk.get_managed_singleton("app.CharacterManager")
+    local event = {
+        time_ms = now_ms(),
+        dt_ms = math.max(0, now_ms() - (state.pool_trace_started_ms or 0)),
+        scene = get_current_scene(),
+        reason = safe_string(reason or "sample"),
+        character_manager = safe_string(char_mgr),
+        player_contexts = {},
+        pool = {},
+        counts = {},
+    }
+    if not char_mgr then
+        event.signature = "no-character-manager"
+        return event
+    end
+
+    local player_list = nil
+    local spawnable_list = nil
+    local pool_list = nil
+    local spawn_data_db = nil
+    local context_db = nil
+    local spawn_owner = nil
+    pcall(function() player_list = char_mgr:get_field("<PlayerContextList>k__BackingField") end)
+    pcall(function() spawnable_list = char_mgr:get_field("<SpawnableContextList>k__BackingField") end)
+    pcall(function() pool_list = char_mgr:get_field("<CharacterPool>k__BackingField") end)
+    pcall(function() spawn_data_db = char_mgr:get_field("<CharacterSpawnDataDB>k__BackingField") end)
+    pcall(function() context_db = char_mgr:get_field("<CharacterContextDB>k__BackingField") end)
+    pcall(function() spawn_owner = char_mgr:get_field("<SpawnOwnerDictionary>k__BackingField") end)
+
+    event.counts.player_contexts = trace_count(player_list)
+    event.counts.spawnable_contexts = trace_count(spawnable_list)
+    event.counts.character_pool = trace_count(pool_list)
+    event.counts.spawn_data_db = trace_count(spawn_data_db)
+    event.counts.context_db = trace_count(context_db)
+    event.counts.spawn_owner = trace_count(spawn_owner)
+
+    for i = 0, math.min(event.counts.player_contexts - 1, 5) do
+        table.insert(event.player_contexts, trace_context_summary(trace_item(player_list, i), i))
+    end
+
+    for i = 0, math.min(event.counts.character_pool - 1, 63) do
+        local row = trace_pool_summary(trace_item(pool_list, i), i)
+        if row.updater ~= "" or row.used ~= nil or row.reserved ~= nil or row.finalized ~= nil then
+            table.insert(event.pool, row)
+        end
+    end
+
+    local sig_parts = {
+        "pc=" .. tostring(event.counts.player_contexts),
+        "sp=" .. tostring(event.counts.spawnable_contexts),
+        "pool=" .. tostring(event.counts.character_pool),
+        "sdb=" .. tostring(event.counts.spawn_data_db),
+        "cdb=" .. tostring(event.counts.context_db),
+        "owner=" .. tostring(event.counts.spawn_owner),
+    }
+    for _, ctx in ipairs(event.player_contexts) do
+        table.insert(sig_parts, "ctx" .. tostring(ctx.index) .. ":" .. safe_string(ctx.updater_type) .. ":" .. safe_string(ctx.game_object))
+    end
+    for _, row in ipairs(event.pool) do
+        table.insert(sig_parts, "p" .. tostring(row.index) .. ":" .. safe_string(row.used) .. ":" .. safe_string(row.reserved) .. ":" .. safe_string(row.finalized) .. ":" .. safe_string(row.updater_type) .. ":" .. safe_string(row.updater_game_object))
+    end
+    event.signature = table.concat(sig_parts, "|")
+    return event
+end
+
+local function reset_pool_trace(reason)
+    state.pool_trace_events = {}
+    state.pool_trace_dirty = true
+    state.pool_trace_started_ms = now_ms()
+    state.pool_trace_last_scene = get_current_scene()
+    state.pool_trace_last_signature = ""
+    state.pool_trace_status = "recording: " .. safe_string(reason or "manual")
+end
+
+local function push_pool_trace_event(reason, force)
+    if not state.pool_trace_enabled then return end
+    local event = build_pool_trace_snapshot(reason)
+    if not force and event.signature == state.pool_trace_last_signature then
+        return
+    end
+    state.pool_trace_last_signature = event.signature
+    table.insert(state.pool_trace_events, event)
+    while #state.pool_trace_events > 500 do
+        table.remove(state.pool_trace_events, 1)
+    end
+    state.pool_trace_dirty = true
+    state.pool_trace_status = "recording events=" .. tostring(#state.pool_trace_events)
+end
+
+local function dump_pool_trace(force)
+    if not force and not state.pool_trace_dirty then return end
+    state.pool_trace_dirty = false
+    pcall(function()
+        json.dump_file(POOL_TRACE_FILE, {
+            time_ms = now_ms(),
+            active = state.pool_trace_enabled,
+            status = state.pool_trace_status,
+            scene = get_current_scene(),
+            started_ms = state.pool_trace_started_ms,
+            events = state.pool_trace_events,
         })
     end)
 end
@@ -3172,6 +3386,8 @@ local function write_dev_result(id, ok, message)
             spawn_hook_events = #state.spawn_hook_events,
             level_trace_status = state.level_trace_status,
             level_trace_events = #state.level_trace_events,
+            pool_trace_status = state.pool_trace_status,
+            pool_trace_events = #state.pool_trace_events,
         })
     end)
 end
@@ -3229,6 +3445,26 @@ local function poll_dev_command()
     elseif action == "dump_level_trace" then
         dump_level_trace(true)
         message = state.level_trace_status .. " events=" .. tostring(#state.level_trace_events)
+    elseif action == "start_pool_trace" then
+        state.pool_trace_enabled = true
+        cfg.pool_trace_enabled = true
+        save_cfg()
+        reset_pool_trace(cmd.text ~= "" and cmd.text or "dev command")
+        push_pool_trace_event("start", true)
+        dump_pool_trace(true)
+        message = state.pool_trace_status
+    elseif action == "stop_pool_trace" then
+        push_pool_trace_event("stop", true)
+        state.pool_trace_enabled = false
+        cfg.pool_trace_enabled = false
+        save_cfg()
+        state.pool_trace_status = "stopped events=" .. tostring(#state.pool_trace_events)
+        dump_pool_trace(true)
+        message = state.pool_trace_status
+    elseif action == "dump_pool_trace" then
+        push_pool_trace_event("dump", true)
+        dump_pool_trace(true)
+        message = state.pool_trace_status .. " events=" .. tostring(#state.pool_trace_events)
     elseif action == "diagnostics" then
         dump_runtime_diagnostics()
         message = "runtime diagnostics dumped"
@@ -3592,6 +3828,7 @@ local function draw_main_window()
     end
     imgui.text("Spawn hook: " .. safe_string(state.spawn_hook_status))
     imgui.text("Level trace: " .. safe_string(state.level_trace_status))
+    imgui.text("Pool trace: " .. safe_string(state.pool_trace_status))
     local trace_changed, trace_enabled = imgui.checkbox("Record level-load trace", state.level_trace_enabled)
     if trace_changed then
         state.level_trace_enabled = trace_enabled
@@ -3615,6 +3852,19 @@ local function draw_main_window()
     if imgui.button("Dump Level Trace") then
         dump_level_trace(true)
     end
+    if imgui.button("Reset Pool Trace") then
+        state.pool_trace_enabled = true
+        cfg.pool_trace_enabled = true
+        save_cfg()
+        reset_pool_trace("ui reset")
+        push_pool_trace_event("ui reset", true)
+        dump_pool_trace(true)
+    end
+    imgui.same_line()
+    if imgui.button("Dump Pool Trace") then
+        push_pool_trace_event("ui dump", true)
+        dump_pool_trace(true)
+    end
     if imgui.button("Refresh Spawn Diagnostics") then
         dump_runtime_diagnostics()
     end
@@ -3632,6 +3882,16 @@ re.on_frame(function()
         if scene ~= state.level_trace_last_scene then
             state.level_trace_last_scene = scene
             push_level_trace_note("scene=" .. safe_string(scene))
+        end
+    end
+    if state.pool_trace_enabled then
+        local scene = get_current_scene()
+        if scene ~= state.pool_trace_last_scene then
+            state.pool_trace_last_scene = scene
+            push_pool_trace_event("scene=" .. safe_string(scene), true)
+        elseif t >= state.pool_trace_last_sample + 0.10 then
+            push_pool_trace_event("sample", false)
+            state.pool_trace_last_sample = t
         end
     end
     if t >= state.last_snapshot_time + 0.033 then
@@ -3662,6 +3922,10 @@ re.on_frame(function()
     if t >= state.level_trace_last_dump + 0.50 then
         dump_level_trace(false)
         state.level_trace_last_dump = t
+    end
+    if t >= state.pool_trace_last_dump + 0.50 then
+        dump_pool_trace(false)
+        state.pool_trace_last_dump = t
     end
     apply_remote_pose()
 end)
