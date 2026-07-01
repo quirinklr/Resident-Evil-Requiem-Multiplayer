@@ -1940,6 +1940,152 @@ local function run_request_spawn_registered_duplicate()
     return ok_spawn, state.character_spawn_status
 end
 
+local function run_ready_registered_duplicate()
+    local char_mgr = sdk.get_managed_singleton("app.CharacterManager")
+    if not char_mgr then
+        state.character_spawn_status = "ready duplicate spawn failed: CharacterManager not found"
+        return false, state.character_spawn_status
+    end
+
+    local ctx, lines = create_new_context_id()
+    local kind_grace = get_static_field_value("app.CharacterKindID", {"cp_A100"})
+    local montage_invalid = get_static_field_value("app.MontageID", {"Invalid"})
+    local purpose_default = get_static_field_value("app.CharacterUsePurposeFlag", {"Default"}) or 0
+    if not ctx or not kind_grace or not montage_invalid then
+        state.character_spawn_status = "ready duplicate spawn failed: missing ContextID/Kind/Montage | " .. table.concat(lines, " | ")
+        return false, state.character_spawn_status
+    end
+
+    pcall(function() ctx = ctx:add_ref() end)
+    state.last_spawn_context = ctx
+    pcall(function() state.last_spawn_context_text = safe_string(ctx:call("ToString")) end)
+
+    local duplicate, duplicate_status = duplicate_player_spawn_data(char_mgr, kind_grace, lines)
+    table.insert(lines, "duplicate_status=" .. duplicate_status)
+    if not duplicate then
+        state.character_spawn_status = "ready duplicate spawn failed: " .. table.concat(lines, " | ")
+        state.puppet_status = state.character_spawn_status
+        return false, state.character_spawn_status
+    end
+
+    set_fields_by_type_or_name(duplicate, "app.ContextID", {}, ctx, "SpawnData.ContextID", lines)
+    set_fields_by_type_or_name(duplicate, "app.CharacterKindID", {}, kind_grace, "SpawnData.CharacterKindID", lines)
+
+    local registered = false
+    for _, call_name in ipairs({"registerSpawnData(app.CharacterSpawnData)", "registerSpawnData"}) do
+        local ok, err = pcall(function()
+            char_mgr:call(call_name, duplicate)
+        end)
+        table.insert(lines, call_name .. "(duplicate) -> " .. (ok and "ok" or ("ERR " .. safe_string(err))))
+        if ok then
+            registered = true
+            break
+        end
+    end
+    if not registered then
+        state.character_spawn_status = "ready duplicate spawn failed: registerSpawnData failed | " .. table.concat(lines, " | ")
+        state.puppet_status = state.character_spawn_status
+        return false, state.character_spawn_status
+    end
+
+    local factory = nil
+    for _, call_name in ipairs({"getCharacterContextFactory(app.CharacterKindID)", "getCharacterContextFactory"}) do
+        local ok, result = pcall(function()
+            return char_mgr:call(call_name, kind_grace)
+        end)
+        table.insert(lines, call_name .. "(cp_A100) -> " .. (ok and safe_string(result) or ("ERR " .. safe_string(result))))
+        if ok and result and not factory then
+            factory = result
+        end
+    end
+    if not factory then
+        state.character_spawn_status = "ready duplicate spawn failed: no CharacterContext factory | " .. table.concat(lines, " | ")
+        state.puppet_status = state.character_spawn_status
+        return false, state.character_spawn_status
+    end
+
+    local context_ref = nil
+    for _, attempt in ipairs({
+        {
+            name = "readyContext(app.ContextID, app.CharacterKindID, System.Func`1<app.CharacterContext>, System.Boolean)",
+            args = { ctx, kind_grace, factory, false },
+        },
+        {
+            name = "readyContext(app.ContextID, app.CharacterKindID, System.Func`1<app.CharacterContext>)",
+            args = { ctx, kind_grace, factory },
+        },
+        {
+            name = "readyContext",
+            args = { ctx, kind_grace, factory, false },
+        },
+    }) do
+        local ok, result = pcall(function()
+            return char_mgr:call(attempt.name, unpack_args(attempt.args))
+        end)
+        table.insert(lines, attempt.name .. "(new ctx) -> " .. (ok and safe_string(result) or ("ERR " .. safe_string(result))))
+        if ok and result and not context_ref then
+            context_ref = result
+            pcall(function() context_ref = context_ref:add_ref() end)
+            break
+        end
+    end
+
+    for _, call_name in ipairs({"getContextRef(app.ContextID)", "getContextRef"}) do
+        local ok, result = pcall(function()
+            return char_mgr:call(call_name, ctx)
+        end)
+        table.insert(lines, call_name .. "(new ctx after ready) -> " .. (ok and safe_string(result) or ("ERR " .. safe_string(result))))
+        if ok and result and not context_ref then
+            context_ref = result
+            pcall(function() context_ref = context_ref:add_ref() end)
+        end
+    end
+
+    if context_ref then
+        pcall(function()
+            local go = context_ref:call("get_GameObject")
+            table.insert(lines, "Context.get_GameObject -> " .. safe_string(go))
+            if go then
+                state.puppet_go = go:add_ref()
+                state.puppet_xform = go:call("get_Transform")
+                pcall(function() state.puppet_xform = state.puppet_xform:add_ref() end)
+            end
+        end)
+        pcall(function()
+            local xform = context_ref:call("get_Transform")
+            table.insert(lines, "Context.get_Transform -> " .. safe_string(xform))
+        end)
+    end
+
+    local ok_spawn, err_spawn = pcall(function()
+        char_mgr:call(
+            "requestSpawn(app.ContextID, app.CharacterKindID, app.MontageID, System.Int32, System.Boolean, app.CharacterUsePurposeFlag)",
+            ctx,
+            kind_grace,
+            montage_invalid,
+            0,
+            false,
+            purpose_default
+        )
+    end)
+    table.insert(lines, "requestSpawn(new ready ctx) -> " .. (ok_spawn and "ok" or ("ERR " .. safe_string(err_spawn))))
+
+    dump_spawn_hook_log(true)
+    pcall(function()
+        json.dump_file(DATA_PREFIX .. "ready_spawn_probe.json", {
+            time_ms = now_ms(),
+            scene = get_current_scene(),
+            ok = context_ref ~= nil or ok_spawn,
+            context = state.last_spawn_context_text,
+            lines = lines,
+        })
+    end)
+
+    state.character_spawn_status = "ready duplicate spawn " .. ((context_ref or ok_spawn) and "sent" or "failed") .. " for " .. safe_string(state.last_spawn_context_text)
+    state.puppet_status = context_ref and "Ready context created; check for Grace" or (ok_spawn and "Ready duplicate requestSpawn sent; check for Grace" or state.character_spawn_status)
+    return context_ref ~= nil or ok_spawn, state.character_spawn_status
+end
+
 local function disable_puppet_components(go)
     pcall(function()
         local components = go:call("get_Components")
@@ -2510,6 +2656,8 @@ local function poll_dev_command()
         ok, message = run_request_spawn_new_context()
     elseif action == "spawn_registered_duplicate" then
         ok, message = run_request_spawn_registered_duplicate()
+    elseif action == "spawn_ready_duplicate" then
+        ok, message = run_ready_registered_duplicate()
     elseif action == "context_create_probe" then
         ok, message = run_context_create_probe()
     elseif action == "set_prefab" then
@@ -2841,6 +2989,9 @@ local function draw_main_window()
     imgui.same_line()
     if imgui.button("Try Registered Grace Spawn") then
         run_request_spawn_registered_duplicate()
+    end
+    if imgui.button("Try Ready Grace Spawn") then
+        run_ready_registered_duplicate()
     end
     if imgui.button("Probe New ContextID") then
         run_context_create_probe()
