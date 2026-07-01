@@ -256,4 +256,6 @@ After deployment, these files should exist in the RE9 folder:
 - `dinput8.dll`
 - `reframework/plugins/re9mp.dll`
 - `reframework/autorun/re9mp.lua`
+- `reframework/autorun/re9mp/init.lua`
+- `reframework/autorun/re9mp/legacy_runtime.lua`
 - `reframework_revision.txt` containing `a0e9010fb0449dc9d824b5978ee759eeaf50f7c6`

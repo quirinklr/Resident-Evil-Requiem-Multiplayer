@@ -16,9 +16,10 @@ This file is the project memory for RE9 Requiem multiplayer reverse engineering.
 - Steam AppID: `3764200`
 - BuildID: `23634047`
 - `re9.exe` version: `1.3.1.0`
-- REFramework overlay is loaded and `reframework/autorun/re9mp.lua` is active.
+- REFramework overlay is loaded and `reframework/autorun/re9mp.lua` is active as a bootstrap.
+- Current Lua runtime still lives in `reframework/autorun/re9mp/legacy_runtime.lua` while cleanup extraction continues.
 - Latest pushed repo commit before this memory file: `56fbd37 Add targeted character pool trace`
-- Current Lua bridge is deployed by copying `reframework/autorun/re9mp.lua` into the game install. Lua changes require REFramework `Reset scripts` or a RE9 restart.
+- Current Lua bridge is deployed by copying `reframework/autorun/re9mp.lua` and the `reframework/autorun/re9mp/` module folder into the game install. Lua changes require REFramework `Reset scripts` or a RE9 restart.
 
 ## Working Runtime Facts
 
@@ -229,7 +230,8 @@ The `spawn_load_order_grace` probe tried to mimic the real load order:
 
 ## Current Lua Diagnostics
 
-- Main Lua file: `reframework/autorun/re9mp.lua`.
+- Main Lua bootstrap: `reframework/autorun/re9mp.lua`.
+- Current Lua runtime module: `reframework/autorun/re9mp/legacy_runtime.lua`.
 - Runtime output folder in game install: `reframework/data/re9mp/`.
 - Important runtime files:
   - `status.json`
@@ -465,4 +467,4 @@ These are not facts yet:
 - Do not run per-slot material texture copy again; avoid `via.render.Mesh.getMaterialTexture` in the clone spawn path.
 - Do not call `via.render.Mesh.set_SharedSkeletonGameObject(...)`, `app.CharacterMeshControllerBase.notifyMeshUnitChanged()`, or `via.render.Mesh.set_MaterialParamCount` in a live clone path unless a new isolated test proves them safe.
 - Use small JSON outputs only; avoid broad UI dumps that can freeze RE9.
-- After Lua changes, deploy `reframework/autorun/re9mp.lua`, then user must use `Reset scripts` or restart RE9 for the new code to load.
+- After Lua changes, deploy `reframework/autorun/re9mp.lua` and the `reframework/autorun/re9mp/` module folder, then user must use `Reset scripts` or restart RE9 for the new code to load.
