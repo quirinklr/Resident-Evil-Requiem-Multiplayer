@@ -982,3 +982,71 @@ local function install_spawn_observer_hooks()
         dump_spawn_hook_log(true)
     end
 end
+
+function re9mp_install_load_phase_controller_minimal_hook()
+    if state.load_phase_minimal_controller_hook_attempted then return end
+    state.load_phase_minimal_controller_hook_attempted = true
+
+    local ok, err = pcall(function()
+        local controller_td = sdk.find_type_definition("app.LevelPlayerCreateController")
+        if not controller_td then
+            state.load_phase_injection_status = "minimal hook failed: LevelPlayerCreateController type not found"
+            return
+        end
+
+        local installed = 0
+        for _, method in ipairs(controller_td:get_methods()) do
+            local name = method:get_name()
+            if name == "setupControlCharacter" then
+                sdk.hook(method, function(args)
+                    if state.load_phase_injection_armed
+                        and not state.load_phase_injection_done
+                        and not state.load_phase_injection_guard then
+                        local pending_control = args and hook_arg_to_managed(args[2]) or nil
+                        local pending_setting = args and hook_arg_to_managed(args[3]) or nil
+                        pcall(function()
+                            if pending_control and pending_control.add_ref then
+                                pending_control = pending_control:add_ref()
+                            end
+                        end)
+                        pcall(function()
+                            if pending_setting and pending_setting.add_ref then
+                                pending_setting = pending_setting:add_ref()
+                            end
+                        end)
+                        state.load_phase_injection_pending_control = pending_control
+                        state.load_phase_injection_pending_setting = pending_setting
+                        state.load_phase_injection_pre_lines = {}
+                        pcall(function()
+                            re9mp_append_spawn_control_identity_summary(
+                                state.load_phase_injection_pre_lines,
+                                "Control.real_pre_setup",
+                                pending_control,
+                                140
+                            )
+                        end)
+                    end
+                end, function(retval)
+                    if state.load_phase_injection_armed
+                        and not state.load_phase_injection_done
+                        and not state.load_phase_injection_guard then
+                        pcall(function()
+                            re9mp_maybe_run_load_phase_player_clone_injection(
+                                state.load_phase_injection_pending_control,
+                                state.load_phase_injection_pending_setting,
+                                "minimal_post_setupControlCharacter"
+                            )
+                        end)
+                    end
+                    return retval
+                end)
+                installed = installed + 1
+            end
+        end
+        state.spawn_hook_status = "minimal controller hooks installed=" .. tostring(installed)
+    end)
+
+    if not ok then
+        state.spawn_hook_status = "minimal controller hook error: " .. safe_string(err)
+    end
+end

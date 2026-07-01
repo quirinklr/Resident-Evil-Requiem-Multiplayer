@@ -108,6 +108,8 @@ This file is the project memory for RE9 Requiem multiplayer reverse engineering.
   - `setup_request_spawn` now runs `setupControlCharacter(...)` to create/register the new context, then calls `CharacterManager:requestSpawn(new, cp_A100, MontageID.Invalid, 0, false, Default)` instead of `createControlCharacter()`.
   - The purpose is to test whether the engine can allocate/finalize a visible `Cp_A100Updater`/GameObject for the new context without hijacking `onChangeActivePlayer`.
   - If `setup_request_spawn` still hijacks or stays invisible, the next target is the pool/updater allocation boundary, not more mesh-parent compensation.
+  - 2026-07-01 broad `setup_request_spawn` arm from Main Menu caused the game to remain on `Lädt...`. Logs showed `load_phase_injection_armed=true`, `done=false`, `scene=""`, no level events, no bind events, and no spawn-hook events; the injection itself did not trigger. Cancel/stop commands were processed afterwards, so Lua was still ticking. Treat this as a negative result for the broad hook/trace load setup, not for `requestSpawn` itself.
+  - Follow-up implementation: for `setup_request_spawn`, arm only a minimal `LevelPlayerCreateController.setupControlCharacter` hook and disable level/pool/bind/spawn observer tracing during load. Use this minimal path for the next Main Menu -> gameplay pass.
 
 ## Network Facts
 

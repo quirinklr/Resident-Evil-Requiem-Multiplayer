@@ -1622,6 +1622,74 @@ local function install_spawn_observer_hooks()
     end
 end
 
+function re9mp_install_load_phase_controller_minimal_hook()
+    if state.load_phase_minimal_controller_hook_attempted then return end
+    state.load_phase_minimal_controller_hook_attempted = true
+
+    local ok, err = pcall(function()
+        local controller_td = sdk.find_type_definition("app.LevelPlayerCreateController")
+        if not controller_td then
+            state.load_phase_injection_status = "minimal hook failed: LevelPlayerCreateController type not found"
+            return
+        end
+
+        local installed = 0
+        for _, method in ipairs(controller_td:get_methods()) do
+            local name = method:get_name()
+            if name == "setupControlCharacter" then
+                sdk.hook(method, function(args)
+                    if state.load_phase_injection_armed
+                        and not state.load_phase_injection_done
+                        and not state.load_phase_injection_guard then
+                        local pending_control = args and hook_arg_to_managed(args[2]) or nil
+                        local pending_setting = args and hook_arg_to_managed(args[3]) or nil
+                        pcall(function()
+                            if pending_control and pending_control.add_ref then
+                                pending_control = pending_control:add_ref()
+                            end
+                        end)
+                        pcall(function()
+                            if pending_setting and pending_setting.add_ref then
+                                pending_setting = pending_setting:add_ref()
+                            end
+                        end)
+                        state.load_phase_injection_pending_control = pending_control
+                        state.load_phase_injection_pending_setting = pending_setting
+                        state.load_phase_injection_pre_lines = {}
+                        pcall(function()
+                            re9mp_append_spawn_control_identity_summary(
+                                state.load_phase_injection_pre_lines,
+                                "Control.real_pre_setup",
+                                pending_control,
+                                140
+                            )
+                        end)
+                    end
+                end, function(retval)
+                    if state.load_phase_injection_armed
+                        and not state.load_phase_injection_done
+                        and not state.load_phase_injection_guard then
+                        pcall(function()
+                            re9mp_maybe_run_load_phase_player_clone_injection(
+                                state.load_phase_injection_pending_control,
+                                state.load_phase_injection_pending_setting,
+                                "minimal_post_setupControlCharacter"
+                            )
+                        end)
+                    end
+                    return retval
+                end)
+                installed = installed + 1
+            end
+        end
+        state.spawn_hook_status = "minimal controller hooks installed=" .. tostring(installed)
+    end)
+
+    if not ok then
+        state.spawn_hook_status = "minimal controller hook error: " .. safe_string(err)
+    end
+end
+
 
 -- chunk: tracing/legacy_20_diagnostics_helpers.lua
 -- Diagnostics helpers extracted from pre-split runtime lines 1611-2713.
@@ -5436,11 +5504,12 @@ function re9mp_arm_load_phase_player_clone_injection(mode)
     state.remote_samples = {}
     state.remote_last_seq = nil
     state.remote_prev_seq = nil
+    local minimal_trace = requested == "setup_request_spawn"
     cfg.local_dummy = false
     cfg.auto_spawn_puppet = false
-    cfg.level_trace_enabled = true
-    cfg.pool_trace_enabled = true
-    cfg.bind_trace_enabled = true
+    cfg.level_trace_enabled = not minimal_trace
+    cfg.pool_trace_enabled = not minimal_trace
+    cfg.bind_trace_enabled = not minimal_trace
     cfg.controller_trace_enabled = true
     save_cfg()
 
@@ -5461,24 +5530,34 @@ function re9mp_arm_load_phase_player_clone_injection(mode)
     state.load_phase_injection_context_ref_source = ""
     state.load_phase_injection_request_spawn_ok = false
 
-    state.level_trace_enabled = true
-    state.pool_trace_enabled = true
-    state.bind_trace_enabled = true
-    state.spawn_hook_enabled = true
+    state.level_trace_enabled = not minimal_trace
+    state.pool_trace_enabled = not minimal_trace
+    state.bind_trace_enabled = not minimal_trace
+    state.spawn_hook_enabled = not minimal_trace
     state.spawn_hook_events = {}
     state.spawn_hook_dirty = true
-    state.spawn_hook_status = "cleared for load-phase injection"
-    reset_level_trace("load-phase injection " .. requested)
-    reset_pool_trace("load-phase injection " .. requested)
-    reset_bind_trace("load-phase injection " .. requested)
-    push_pool_trace_event("load-phase injection armed", true)
-    install_spawn_observer_hooks()
-    install_bind_trace_hooks()
+    if minimal_trace then
+        state.spawn_hook_status = "minimal load-phase controller hook armed"
+        state.level_trace_status = "minimal mode disabled for load-phase injection"
+        state.pool_trace_status = "minimal mode disabled for load-phase injection"
+        state.bind_trace_status = "minimal mode disabled for load-phase injection"
+        re9mp_install_load_phase_controller_minimal_hook()
+    else
+        state.spawn_hook_status = "cleared for load-phase injection"
+        reset_level_trace("load-phase injection " .. requested)
+        reset_pool_trace("load-phase injection " .. requested)
+        reset_bind_trace("load-phase injection " .. requested)
+        push_pool_trace_event("load-phase injection armed", true)
+        install_spawn_observer_hooks()
+        install_bind_trace_hooks()
+    end
     re9mp_dump_load_phase_injection_probe("armed")
-    dump_spawn_hook_log(true)
-    dump_level_trace(true)
-    dump_pool_trace(true)
-    dump_bind_trace(true)
+    if not minimal_trace then
+        dump_spawn_hook_log(true)
+        dump_level_trace(true)
+        dump_pool_trace(true)
+        dump_bind_trace(true)
+    end
     return true, "load-phase player clone injection armed mode=" .. requested .. "; go Main Menu -> load gameplay"
 end
 
