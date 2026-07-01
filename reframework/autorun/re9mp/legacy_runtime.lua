@@ -31,6 +31,7 @@ end
 
 local base_paths = {
     script_dir(),
+    "C:/Program Files (x86)/Steam/steamapps/common/RESIDENT EVIL requiem BIOHAZARD requiem/reframework/autorun/re9mp/",
     "reframework/autorun/re9mp/",
     "autorun/re9mp/",
     "re9mp/",

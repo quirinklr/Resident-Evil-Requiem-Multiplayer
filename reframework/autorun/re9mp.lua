@@ -21,7 +21,7 @@ local function script_dir()
 end
 
 local function run_first_existing(paths)
-    local last_error = ""
+    local errors = {}
     for _, path in ipairs(paths) do
         local ok, result = pcall(function()
             return dofile(path)
@@ -29,14 +29,16 @@ local function run_first_existing(paths)
         if ok then
             return true, result
         end
-        last_error = tostring(result)
+        errors[#errors + 1] = tostring(path) .. " => " .. tostring(result)
     end
-    return false, last_error
+    return false, table.concat(errors, " | ")
 end
 
 local dir = script_dir()
+local game_autorun = "C:/Program Files (x86)/Steam/steamapps/common/RESIDENT EVIL requiem BIOHAZARD requiem/reframework/autorun/"
 local ok, err = run_first_existing({
     dir .. "re9mp/init.lua",
+    game_autorun .. "re9mp/init.lua",
     "reframework/autorun/re9mp/init.lua",
     "autorun/re9mp/init.lua",
     "re9mp/init.lua",

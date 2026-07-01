@@ -25,13 +25,15 @@ end
 
 local function load_legacy_runtime()
     local dir = script_dir()
+    local game_module = "C:/Program Files (x86)/Steam/steamapps/common/RESIDENT EVIL requiem BIOHAZARD requiem/reframework/autorun/re9mp/"
     local candidates = {
         dir .. "legacy_runtime.lua",
+        game_module .. "legacy_runtime.lua",
         "reframework/autorun/re9mp/legacy_runtime.lua",
         "autorun/re9mp/legacy_runtime.lua",
         "re9mp/legacy_runtime.lua",
     }
-    local last_error = ""
+    local errors = {}
     for _, path in ipairs(candidates) do
         local ok, result = pcall(function()
             return dofile(path)
@@ -47,9 +49,9 @@ local function load_legacy_runtime()
             end)
             return true, result
         end
-        last_error = tostring(result)
+        errors[#errors + 1] = tostring(path) .. " => " .. tostring(result)
     end
-    return false, last_error
+    return false, table.concat(errors, " | ")
 end
 
 local ok, result = load_legacy_runtime()
