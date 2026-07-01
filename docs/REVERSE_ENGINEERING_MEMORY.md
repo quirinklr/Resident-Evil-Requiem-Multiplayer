@@ -46,6 +46,8 @@ This file is the project memory for RE9 Requiem multiplayer reverse engineering.
   - The clone has no locomotion animation; it is a static mesh pose assembled from live mesh units.
   - It still depends on the local Grace parent hierarchy. This makes it visible, but it is not a clean independent remote character.
   - Static dummy tests show it can visually hold a remote position when the player is still, but it glitches when local yaw/pitch/movement changes because local parent rotation fights the clone's world/remote transform updates.
+  - 2026-07-01 post-cleanup retest confirmed this is still not independent: `visual_spawn_probe.json` reported `root_parenting.ok=true`, `root_parenting.method=setParent(via.Transform,true)`, `root_local_hierarchy=true`, and root local position around `z=2.2`. User visual feedback matched this: Grace is visible, but follows local camera/player motion at a fixed offset.
+  - Repeated tests after script reload can leave old RE9MP-registered mesh units inside the live local `PlayerMeshController`; the visible control path now filters `RE9MP Remote Grace*` mesh units out of the source set so it does not recursively clone previous clones.
 - Wanted architecture:
   - A remote Grace should be its own scene-root or character-cluster, not a child of the local Grace.
   - Its transform should be driven directly from remote network snapshots, with animation selected from remote motion/velocity state.

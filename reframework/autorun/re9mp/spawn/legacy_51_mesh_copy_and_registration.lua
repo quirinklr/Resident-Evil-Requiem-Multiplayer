@@ -386,8 +386,17 @@ function copy_mesh_component_resources(src_mesh, dst_mesh, label, lines, mode, c
     return true
 end
 
-function collect_live_mesh_units(mesh_controller, limit)
+function re9mp_is_clone_mesh_unit(unit)
+    local go = nil
+    pcall(function() go = unit and unit:call("get_GameObject") end)
+    local name = safe_string(trace_call(go, "get_Name"))
+    return name:find("RE9MP Remote Grace", 1, true) ~= nil
+end
+
+function collect_live_mesh_units(mesh_controller, limit, options)
     local units = {}
+    local wanted = limit or 32
+    local opts = options or {}
     local mesh_unit_dictionary = nil
     pcall(function() mesh_unit_dictionary = mesh_controller:get_field("<MeshUnitDictionary>k__BackingField") end)
     if not mesh_unit_dictionary then return units end
@@ -395,25 +404,30 @@ function collect_live_mesh_units(mesh_controller, limit)
     pcall(function()
         local iter = mesh_unit_dictionary:call("GetEnumerator")
         if not iter then return end
-        for _ = 1, (limit or 32) do
+        local max_scan = math.max(wanted, math.min(trace_count(mesh_unit_dictionary), 256))
+        for _ = 1, max_scan do
             local moved = iter:call("MoveNext")
             if not moved then break end
             local current = iter:call("get_Current")
             local value = nil
             pcall(function() value = current:call("get_Value") end)
             if not value then value = current end
-            if trace_type_name(value):find("app.MeshUnit", 1, true) then
+            if trace_type_name(value):find("app.MeshUnit", 1, true)
+                and not (opts.exclude_re9mp_clones and re9mp_is_clone_mesh_unit(value)) then
                 table.insert(units, value)
+                if #units >= wanted then break end
             end
         end
     end)
 
     if #units == 0 then
         local count = trace_count(mesh_unit_dictionary)
-        for i = 0, math.min(count - 1, (limit or 32) - 1) do
+        for i = 0, math.min(count - 1, 255) do
             local value = trace_item(mesh_unit_dictionary, i)
-            if trace_type_name(value):find("app.MeshUnit", 1, true) then
+            if trace_type_name(value):find("app.MeshUnit", 1, true)
+                and not (opts.exclude_re9mp_clones and re9mp_is_clone_mesh_unit(value)) then
                 table.insert(units, value)
+                if #units >= wanted then break end
             end
         end
     end

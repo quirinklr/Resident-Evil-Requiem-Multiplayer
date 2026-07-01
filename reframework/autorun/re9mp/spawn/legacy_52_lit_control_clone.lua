@@ -35,7 +35,7 @@ function run_visual_mesh_clone_probe(refs)
         return false, message
     end
 
-    local units = collect_live_mesh_units(mesh_controller, 32)
+    local units = collect_live_mesh_units(mesh_controller, 32, { exclude_re9mp_clones = true })
     report.source_mesh_units = #units
     if #units == 0 then
         local message = "visual mesh clone failed: MeshUnitDictionary empty"
@@ -69,7 +69,8 @@ function run_visual_mesh_clone_probe(refs)
     local detach_after_register_mode = visual_mode == "registered_player_material_lit_detach"
     local scene_detach_after_register_mode = visual_mode == "registered_player_material_lit_scene_detach"
         or visual_mode == "registered_player_material_lit_owned_anchor_detach"
-    local local_hierarchy_mode = visual_mode == "registered_player_material_lit_local"
+    local local_hierarchy_mode = visual_mode == "registered_player_material_lit"
+        or visual_mode == "registered_player_material_lit_local"
         or detach_after_register_mode
         or scene_detach_after_register_mode
     local copy_mode = (visual_mode == "registered_player_material_lit"
@@ -370,9 +371,20 @@ function run_visual_mesh_clone_probe(refs)
     state.puppet_independent_root = detach_ok
     report.created_units = created
     report.ok = created > 0
+    report.independent_root = state.puppet_independent_root and true or false
+    report.parented_control_path = state.puppet_root_parented and true or false
+    report.control_path_note = state.puppet_root_parented
+        and "visible render/material proof only; follows local player transform"
+        or ""
 
     if created > 0 then
-        state.puppet_status = "visual mesh clone spawned units=" .. tostring(created)
+        if state.puppet_root_parented then
+            state.puppet_status = "parented visual control clone spawned units=" .. tostring(created)
+        elseif state.puppet_independent_root then
+            state.puppet_status = "independent visual mesh clone spawned units=" .. tostring(created)
+        else
+            state.puppet_status = "visual mesh clone spawned units=" .. tostring(created)
+        end
     else
         clear_puppet_refs("visual mesh clone failed: no mesh components copied")
     end
